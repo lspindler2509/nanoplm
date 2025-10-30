@@ -103,6 +103,12 @@ def pretrain():
     help="Weight decay"
 )
 @click.option(
+    "--max-grad-norm",
+    type=float,
+    default=1.0,
+    help="Maximum gradient norm for clipping"
+)
+@click.option(
     "--warmup-ratio",
     type=float,
     default=0.05,
@@ -298,6 +304,7 @@ def run(
     lazy_dataset: bool,
     learning_rate: float,
     weight_decay: float,
+    max_grad_norm: float,
     warmup_ratio: float,
     optimizer: str,
     adam_beta1: float,
@@ -346,6 +353,7 @@ def run(
         lazy_dataset=lazy_dataset,
         learning_rate=learning_rate,
         weight_decay=weight_decay,
+        max_grad_norm=max_grad_norm,
         warmup_ratio=warmup_ratio,
         optimizer=optimizer,
         adam_beta1=adam_beta1,
@@ -537,6 +545,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  learning_rate: 1e-3\n # This is the maximum learning in the warmup phase \n"
         "  warmup_ratio: 0.05\n"
         "  weight_decay: 0.0\n"
+        "  max_grad_norm: 1.0  # Gradient clipping for stability\n"
         "  gradient_accumulation_steps: 1\n"
         "  mlm_probability: 0.3\n"
         "  mask_replace_prob: 0.8\n"
@@ -628,7 +637,20 @@ def _load_model_config(config: Dict[str, Any]) -> ProtModernBertMLMConfig:
         raise ValueError("Model configuration is required but not found in YAML")
 
     expected_keys = set(ProtModernBertMLMConfig.__annotations__.keys())
-    present_keys = set(config.keys())
+    present_keys = set(d.keys())
+
+    # Define which keys are optional (triangular attention parameters)
+    optional_keys = {
+        'use_triangular_attention',
+        'triangular_layers', 
+        'triangular_pair_dim',
+        'triangular_heads',
+        'triangular_dropout', 
+        'triangular_mode'
+    }
+    
+    # Required keys are all keys except optional ones
+    required_keys = expected_keys - optional_keys
 
     missing = []
     extra = []
@@ -645,8 +667,7 @@ def _load_model_config(config: Dict[str, Any]) -> ProtModernBertMLMConfig:
             continue
         kwargs[key] = value
 
-    # Any expected-but-absent keys are also missing
-    for key in expected_keys:
+    for key in required_keys:
         if key not in present_keys:
             missing.append(key)
 
