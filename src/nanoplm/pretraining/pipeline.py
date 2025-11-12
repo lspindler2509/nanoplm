@@ -61,6 +61,7 @@ class PretrainingConfig:
     world_size: Union[int, str] = 1
     project_name: str = "nanoplm-pretraining"
     bf16: bool = False
+    save_safetensors:  bool = True
 
 
 @dataclass
@@ -172,6 +173,7 @@ def run_pretraining(
 
     tokenizer = model.tokenizer
     model.to(device)
+    model = model.to(torch.bfloat16) if pretrain_config.bf16 else model
 
     if pretrain_config.lazy_dataset:
         if pretrain_config.train_fasta is None or pretrain_config.val_fasta is None:
@@ -284,6 +286,7 @@ def run_pretraining(
         "dataloader_num_workers": num_workers,
         "bf16": pretrain_config.bf16,
         "dataloader_persistent_workers": False,
+        "save_safetensors": pretrain_config.save_safetensors,
     }
 
     if num_workers > 0:
