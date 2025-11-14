@@ -128,12 +128,12 @@ class TriangularSelfAttention(nn.Module):
         v = v.view(B, N, N, self.num_heads, self.head_dim)  # (B, N, N, H, D)
         
         # Transpose to get cuEquivariance format: (B, N, H, Q, D) where Q=N (second N becomes Q)
-        q = q.permute(0, 1, 3, 2, 4)  # (B, N, N, H, D) -> (B, N, H, N, D)
-        k = k.permute(0, 1, 3, 2, 4)  # (B, N, N, H, D) -> (B, N, H, N, D)
-        v = v.permute(0, 1, 3, 2, 4)  # (B, N, N, H, D) -> (B, N, H, N, D)
-        
-        # Create bias tensor (required parameter): (B, 1, H, Q, K) = (B, 1, H, N, N)
-        bias = torch.zeros(B, 1, self.num_heads, N, N, device=q.device, dtype=torch.float32)
+        q = q.permute(0, 3, 1, 2, 4)  # (B, N, N, H, D) -> (B, N, H, N, D) (wanted B H N N D)
+        k = k.permute(0, 3, 1, 2, 4)  # (B, N, N, H, D) -> (B, N, H, N, D)
+        v = v.permute(0, 3, 1, 2, 4)  # (B, N, N, H, D) -> (B, N, H, N, D)
+
+        # Create bias tensor (required parameter): (B, 1, H, Q, K) = (B, 1, H, N, N) (wanted B H N N)
+        bias = torch.zeros(B, self.num_heads, N, N, device=q.device, dtype=torch.bfloat16)
         
         # Convert mask format for cuEquivariance: (B, N, 1, 1, K) where K=N
         attn_mask = None
@@ -151,20 +151,22 @@ class TriangularSelfAttention(nn.Module):
                 B_mask, N_mask = attention_mask.shape
                 # Create query mask: each query position gets the full sequence mask
                 # (B, N) -> (B, N, 1, 1, N)
-                attn_mask = attention_mask.unsqueeze(2).unsqueeze(3).unsqueeze(4)  # (B, N, 1, 1, 1)
-                attn_mask = attn_mask.expand(B_mask, N_mask, 1, 1, N_mask)  # (B, N, 1, 1, N)
-                # Apply sequence validity: both query and key must be valid
-                key_valid = attention_mask.unsqueeze(1).unsqueeze(2).unsqueeze(3)  # (B, 1, 1, 1, N)
-                attn_mask = attn_mask & key_valid  # (B, N, 1, 1, N)
+                # attn_mask = attention_mask.unsqueeze(2).unsqueeze(3).unsqueeze(4)  # (B, N, 1, 1, 1)
+                # attn_mask = attn_mask.expand(B_mask, N_mask, 1, 1, N_mask)  # (B, N, 1, 1, N)
+                # # Apply sequence validity: both query and key must be valid
+                # key_valid = attention_mask.unsqueeze(1).unsqueeze(2).unsqueeze(3)  # (B, 1, 1, 1, N)
+                # attn_mask = attn_mask & key_valid  # (B, N, 1, 1, N)
+                attn_mask = attention_mask.unsqueeze(2) & attention_mask.unsqueeze(1)  # (B, N, N)
             else:
                 print(f"⚠️  Unsupported mask dimension: {attention_mask.dim()}, using no mask", file=sys.stderr)
                 attn_mask = None
         
         # API: triangle_attention(q, k, v, bias, mask=None, scale=None, return_aux=False)
         try:
-            from cuequivariance_torch import triangle_attention
-            from cuequivariance_ops_torch import init_triton_cache
-            init_triton_cache()
+            #from cuequivariance_torch import triangle_attention
+            #from cuequivariance_ops_torch import init_triton_cache
+            #init_triton_cache()
+            from trifast import triangle_attention
         except ImportError as e:
             raise ImportError(
                 f"Failed to import cuEquivariance triangle_attention. "
@@ -179,13 +181,14 @@ class TriangularSelfAttention(nn.Module):
         if self.orientation == "per_row":
             # Starting update: triangular attention where we update (i,j) based on (i,k) and (k,j)
             try:
-                attn_output = triangle_attention(
-                    q=q, k=k, v=v,
-                    bias=bias,
-                    mask=attn_mask,
-                    scale=scale,
-                    return_aux=False
-                )
+                attn_output = triangle_attention(q, k, v, bias, attn_mask)
+                # attn_output = triangle_attention(
+                #     q=q, k=k, v=v,
+                #     bias=bias,
+                #     mask=attn_mask,
+                #     scale=scale,
+                #     return_aux=False
+                # )
             except Exception as e:
                 print(f"💥 TRIANGLE_ATTENTION ERROR (per_row): {type(e).__name__}: {e}", file=sys.stderr)
                 raise e
@@ -194,33 +197,34 @@ class TriangularSelfAttention(nn.Module):
             # For column-wise updates, we need to transpose the sequence dimensions
             # This changes how we attend: instead of row i attending to all columns j,
             # we want column j attending to all rows i
-            q_t = q.transpose(1, 3)  # (B, N, H, N, D) -> (B, N, H, N, D) - swap query/key sequence dims
-            k_t = k.transpose(1, 3)  # (B, N, H, N, D) -> (B, N, H, N, D)
-            v_t = v.transpose(1, 3)  # (B, N, H, N, D) -> (B, N, H, N, D)
-            bias_t = bias.transpose(3, 4)  # (B, 1, H, N, N) -> (B, 1, H, N, N) - swap bias dims
+            q_t = q.transpose(2, 3)  # (B, N, H, N, D) -> (B, N, H, N, D) - swap query/key sequence dims
+            k_t = k.transpose(2, 3)  # (B, N, H, N, D) -> (B, N, H, N, D)
+            v_t = v.transpose(2, 3)  # (B, N, H, N, D) -> (B, N, H, N, D) BHNND
+            bias_t = bias.transpose(2, 3)  # (B, 1, H, N, N) -> (B, 1, H, N, N) - swap bias dims BHNN
             
             attn_mask_t = None
             if attn_mask is not None:
-                attn_mask_t = attn_mask.transpose(1, 4)  # (B, N, 1, 1, N) -> (B, N, 1, 1, N) - swap mask dims
+                attn_mask_t = attn_mask.transpose(1, 2)  # (B, N, 1, 1, N) -> (B, N, 1, 1, N) - swap mask dims
             
             try:
-                attn_output = triangle_attention(
-                    q=q_t, k=k_t, v=v_t,
-                    bias=bias_t,
-                    mask=attn_mask_t,
-                    scale=scale,
-                    return_aux=False
-                )
+                # attn_output = triangle_attention(
+                #     q=q_t, k=k_t, v=v_t,
+                #     bias=bias_t,
+                #     mask=attn_mask_t,
+                #     scale=scale,
+                #     return_aux=False
+                # )
+                attn_output = triangle_attention(q_t, k_t, v_t, bias_t, attn_mask_t)
                 
                 # Transpose back for ending update
-                attn_output = attn_output.transpose(1, 3)  # Transpose back from column-wise
+                attn_output = attn_output.transpose(2, 3)  # Transpose back from column-wise
             except Exception as e:
                 print(f"💥 TRIANGLE_ATTENTION ERROR (per_column): {type(e).__name__}: {e}", file=sys.stderr)
                 raise e
         
         # Reshape back to (B, N, N, C) from (B, N, H, Q, D) where Q=N
         # (B, N, H, N, D) -> (B, N, N, H, D) -> (B, N, N, C)
-        attn_output = attn_output.permute(0, 1, 3, 2, 4)  # (B, N, H, N, D) -> (B, N, N, H, D)
+        attn_output = attn_output.permute(0, 2, 3, 1, 4)  # (B, N, H, N, D) BHNND -> (B, N, N, H, D)
         attn_output = attn_output.contiguous().view(B, N, N, C)  # (B, N, N, H*D)
         
         # Output projection
