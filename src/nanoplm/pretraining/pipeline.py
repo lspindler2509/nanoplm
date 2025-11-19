@@ -43,7 +43,7 @@ class PretrainingConfig:
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
     adam_epsilon: float = 1e-8
-    learning_rate: float = 3e-6
+    learning_rate: float = 1e-3
     weight_decay: float = 0.0
     max_grad_norm: float = 1.0  # Gradient clipping threshold
     gradient_accumulation_steps: int = 1
@@ -173,7 +173,6 @@ def run_pretraining(
 
     tokenizer = model.tokenizer
     model.to(device)
-    model = model.to(torch.bfloat16) if pretrain_config.bf16 else model
 
     if pretrain_config.lazy_dataset:
         if pretrain_config.train_fasta is None or pretrain_config.val_fasta is None:
