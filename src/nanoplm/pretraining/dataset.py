@@ -287,10 +287,10 @@ class LoadShardedFastaMLMDataset(Dataset):
 
         # Streaming path: open file on-demand
         with h5py.File(self.shard_paths[shard_idx], "r") as f:
-            input_ids = torch.tensor(f["input_ids"][local_idx], dtype=torch.long)
-            attention_mask = torch.tensor(
-                f["attention_mask"][local_idx], dtype=torch.long
-            )
+            input_ids = torch.tensor(f["input_ids"][local_idx], dtype=torch.uint8)
+
+        # Generate attention_mask on-the-fly: 1 for non-padding tokens, 0 for padding (pad_token_id=0)
+        attention_mask = (input_ids != 0).to(torch.uint8)
 
         return {
             "input_ids": input_ids,
