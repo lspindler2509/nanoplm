@@ -637,7 +637,7 @@ def _load_model_config(config: Dict[str, Any]) -> ProtModernBertMLMConfig:
         raise ValueError("Model configuration is required but not found in YAML")
 
     expected_keys = set(ProtModernBertMLMConfig.__annotations__.keys())
-    present_keys = set(d.keys())
+    present_keys = set(config.keys())
 
     # Define which keys are optional (triangular attention parameters)
     optional_keys = {
