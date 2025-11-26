@@ -79,7 +79,8 @@ class TriangularSelfAttention(nn.Module):
     def forward(
         self, 
         pair_repr: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None
+        attention_mask: Optional[torch.Tensor] = None,
+        ta_layer_num: Optional[int] = None
     ) -> torch.Tensor:
         """
         Forward pass of triangular attention.
@@ -96,13 +97,20 @@ class TriangularSelfAttention(nn.Module):
         assert C == self.pair_dim, f"Expected pair_dim {self.pair_dim}, got {C}"
         
         # Apply layer norm
-        normed_input = self.norm(pair_repr)
+        normed_input = self.norm(pair_repr).to(torch.bfloat16)
         
         # Always use NVIDIA cuEquivariance (availability checked in __init__)
         output = self._cuequivariance_triangular_attention(normed_input, attention_mask)
         
         # Apply gating (residual connection with learned gate)
         gate = torch.sigmoid(self.gate_proj(pair_repr))
+        if torch.rand(1).item() < 0.0001:
+            print(f"[TriAttn] gate stats at layer {ta_layer_num}: min={gate.min().item():.4f}, max={gate.max().item():.4f}")
+            print(f"[TriAttn] mean gate = {gate.mean().item():.4f}")
+            delta = (output - normed_input).abs().mean().item()
+            print(f"[TriAttn] delta input→output = {delta:.4f}")
+            print("\n")
+
         output = gate * output + (1 - gate) * normed_input
         
         return output
@@ -275,6 +283,7 @@ class PairwiseTriangularBlock(nn.Module):
         pair_dim: int,
         num_heads: int = 8,
         dropout: float = 0.1,
+        use_multiplication: bool = True
     ):
         super().__init__()
         
@@ -283,26 +292,29 @@ class PairwiseTriangularBlock(nn.Module):
         self.num_heads = num_heads
         self.head_dim = pair_dim // num_heads
         self.dropout = dropout
+        self.use_multiplication = use_multiplication
+        
+        if not self.use_multiplication:
 
-        # --- Triangular attention modules ---
-        self.tri_attn_row = TriangularSelfAttention(
-            pair_dim=pair_dim,
-            num_heads=num_heads,
-            head_dim=self.head_dim,
-            dropout=dropout,
-            orientation="per_row"
-        )
-        self.tri_attn_col = TriangularSelfAttention(
-            pair_dim=pair_dim,
-            num_heads=num_heads,
-            head_dim=self.head_dim,
-            dropout=dropout,
-            orientation="per_column"
-        )
+            # --- Triangular attention modules ---
+            self.tri_attn_row = TriangularSelfAttention(
+                pair_dim=pair_dim,
+                num_heads=num_heads,
+                head_dim=self.head_dim,
+                dropout=dropout,
+                orientation="per_row"
+            )
+            self.tri_attn_col = TriangularSelfAttention(
+                pair_dim=pair_dim,
+                num_heads=num_heads,
+                head_dim=self.head_dim,
+                dropout=dropout,
+                orientation="per_column"
+            )
 
         # --- Residue → Pair projections (AlphaFold-style) ---
-        self.residue_to_pair_left = nn.Linear(residue_dim, pair_dim // 2)
-        self.residue_to_pair_right = nn.Linear(residue_dim, pair_dim // 2)
+        self.residue_to_pair_left = nn.Linear(residue_dim, pair_dim)
+        self.residue_to_pair_right = nn.Linear(residue_dim, pair_dim)
 
         # --- Pair → Residue projection ---
         self.pair_to_residue = nn.Linear(pair_dim, residue_dim)
@@ -328,7 +340,8 @@ class PairwiseTriangularBlock(nn.Module):
         self,
         residue_repr: torch.Tensor,
         pair_repr: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None
+        attention_mask: Optional[torch.Tensor] = None,
+        ta_layer_num: Optional[int] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass combining residue and pair representations.
@@ -343,14 +356,35 @@ class PairwiseTriangularBlock(nn.Module):
         # Initialize pair representation if missing
         if pair_repr is None:
             pair_repr = self._create_pair_representation(residue_repr)
+        
+        if not self.use_multiplication:
 
-        # --- Triangular attention updates ---
-        pair_repr = self.tri_attn_row(pair_repr, attention_mask=attention_mask) # already includes norm & gating
-        pair_repr = self.tri_attn_col(pair_repr, attention_mask=attention_mask) # already includes norm & gating
+            # --- Triangular attention updates ---
+            pair_repr = self.tri_attn_row(pair_repr, attention_mask=attention_mask, ta_layer_num=ta_layer_num) # already includes norm & gating
+            pair_repr = self.tri_attn_col(pair_repr, attention_mask=attention_mask, ta_layer_num=ta_layer_num+1) # already includes norm & gating
+        
+        else:
+            attn_mask = None
+            if attention_mask is not None:
+                if attention_mask.dtype != torch.bool:
+                    attention_mask = attention_mask.bool()
+                B_mask, N_mask = attention_mask.shape
+                attn_mask = attention_mask.unsqueeze(2) & attention_mask.unsqueeze(1)  # (B, N, N)
+
+            from cuequivariance_torch import triangle_multiplicative_update
+            pair_repr = triangle_multiplicative_update(
+                x=pair_repr,
+                direction="outgoing",  # or "incoming"
+                mask=attn_mask,
+            )
+            pair_repr = triangle_multiplicative_update(
+                x=pair_repr,
+                direction="incoming",  # or "outgoing"
+                mask=attn_mask,
+            )
 
         # --- Pair → Residue projection ---
-        pair_repr_normed = self.norm_pair_to_residue(pair_repr)
-        
+        pair_repr_normed = self.norm_pair_to_residue(pair_repr).to(torch.bfloat16)
         aggregated_info = pair_repr_normed.mean(dim=2)
         
         updated_residue = self.pair_to_residue(aggregated_info)
@@ -363,37 +397,24 @@ class PairwiseTriangularBlock(nn.Module):
     
     def _create_pair_representation(self, residue_repr: torch.Tensor) -> torch.Tensor:
         """
-        Create intelligent pair representation from residue representations.
-        Uses AlphaFold-style outer product.
-        
+        AlphaFold-style pair representation:
+        pair[i,j] = linear_left(res_i) + linear_right(res_j)
+
         Args:
             residue_repr: Residue representations (B, N, residue_dim)
-            
+
         Returns:
             Pair representation (B, N, N, pair_dim)
         """
         B, N, residue_dim = residue_repr.shape
-        
-        # Project residues to left and right representations
-        left_proj = self.residue_to_pair_left(residue_repr)   # (B, N, pair_dim//2)
-        right_proj = self.residue_to_pair_right(residue_repr) # (B, N, pair_dim//2)
-        
-        # Create outer product: (i,j) gets info from both residue i and residue j
-        # left_proj[i] ⊗ right_proj[j] for all i,j pairs
-        left_expanded = left_proj.unsqueeze(2)   # (B, N, 1, pair_dim//2)
-        right_expanded = right_proj.unsqueeze(1) # (B, 1, N, pair_dim//2)
-        
-        # Broadcast and concatenate to create pair features
-        left_broadcast = left_expanded.expand(B, N, N, -1)   # (B, N, N, pair_dim//2)
-        right_broadcast = right_expanded.expand(B, N, N, -1) # (B, N, N, pair_dim//2)
-        
-        # Concatenate left and right projections
-        outer_product = torch.cat([left_broadcast, right_broadcast], dim=-1)  # (B, N, N, pair_dim//2 * 2)
-        
-        return outer_product
 
+        left_proj = self.residue_to_pair_left(residue_repr)      # (B, N, pair_dim)
+        right_proj = self.residue_to_pair_right(residue_repr)    # (B, N, pair_dim)
 
+        # Broadcast + addition (AlphaFold)
+        pair = left_proj.unsqueeze(2) + right_proj.unsqueeze(1)  # (B, N, N, pair_dim)
 
+        return pair
 
 
 def create_triangular_attention_layer(

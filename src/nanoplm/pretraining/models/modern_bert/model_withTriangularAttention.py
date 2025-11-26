@@ -9,6 +9,7 @@ from nanoplm.models.student.triangular_attention import create_triangular_attent
 from transformers.modeling_outputs import MaskedLMOutput
 import torch.nn.functional as F
 import math
+from contextlib import nullcontext
 
 
 try:
@@ -381,11 +382,11 @@ class ModernBertModelWithTriangularAttention(ModernBertPreTrainedModel):
                     padded_hidden_states = _pad_modernbert_output(
                         hidden_states, indices, batch_size, seq_len
                     )
-                    # ToDo: do we need to pass pair_repr here?
                     triangular_output, pair_repr = layer(
                         padded_hidden_states,
                         pair_repr=pair_repr,
                         attention_mask=attention_mask,
+                        ta_layer_num=i,
                     )
                     if i < len(self.layers) - 1:  # nicht bei letztem layer
                         hidden_states, *_ = _unpad_modernbert_input(
@@ -502,18 +503,18 @@ class ModernBertEmbeddings(nn.Module):
 
     @torch.compile(dynamic=True)
     def compiled_embeddings(self, input_ids: torch.LongTensor) -> torch.Tensor:
-        return self.drop(self.norm(self.tok_embeddings(input_ids)))
+        return self.drop(self.norm(self.tok_embeddings(input_ids)).to(torch.bfloat16))
 
     def forward(
         self, input_ids: Optional[torch.LongTensor] = None, inputs_embeds: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         if inputs_embeds is not None:
-            hidden_states = self.drop(self.norm(inputs_embeds))
+            hidden_states = self.drop(self.norm(inputs_embeds).to(torch.bfloat16))
         else:
             hidden_states = (
                 self.compiled_embeddings(input_ids)
                 if self.config.reference_compile
-                else self.drop(self.norm(self.tok_embeddings(input_ids)))
+                else self.drop(self.norm(self.tok_embeddings(input_ids)).to(torch.bfloat16))
             )
         return hidden_states
     
