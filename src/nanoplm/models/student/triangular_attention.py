@@ -11,9 +11,11 @@ high-performance triangular attention operations.
 import sys
 import math
 import torch
+import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
+from scipy.stats import truncnorm
 
 class TriangularSelfAttention(nn.Module):
     """
@@ -311,6 +313,26 @@ class PairwiseTriangularBlock(nn.Module):
                 dropout=dropout,
                 orientation="per_column"
             )
+        else:
+            self.norm_in = nn.LayerNorm(pair_dim, eps=1e-5)
+            self.p_in = nn.Linear(pair_dim, 2 * pair_dim, bias=False)
+            self.g_in = nn.Linear(pair_dim, 2 * pair_dim, bias=False)
+
+            self.norm_out = nn.LayerNorm(pair_dim)
+            self.p_out = nn.Linear(pair_dim, pair_dim, bias=False)
+            self.g_out = nn.Linear(pair_dim, pair_dim, bias=False)
+
+            bias_init_one_(self.norm_in.weight)
+            bias_init_zero_(self.norm_in.bias)
+
+            lecun_normal_init_(self.p_in.weight)
+            gating_init_(self.g_in.weight)
+
+            bias_init_one_(self.norm_out.weight)
+            bias_init_zero_(self.norm_out.bias)
+
+            final_init_(self.p_out.weight)
+            gating_init_(self.g_out.weight)
 
         # --- Residue → Pair projections (AlphaFold-style) ---
         self.residue_to_pair_left = nn.Linear(residue_dim, pair_dim)
@@ -368,19 +390,41 @@ class PairwiseTriangularBlock(nn.Module):
             if attention_mask is not None:
                 if attention_mask.dtype != torch.bool:
                     attention_mask = attention_mask.bool()
-                B_mask, N_mask = attention_mask.shape
-                attn_mask = attention_mask.unsqueeze(2) & attention_mask.unsqueeze(1)  # (B, N, N)
+                if attention_mask.dim() == 2:
+                    B_mask, N_mask = attention_mask.shape
+                    attn_mask = attention_mask.unsqueeze(2) & attention_mask.unsqueeze(1)  # (B, N, N)
+                elif attention_mask.dim() == 4:
+                    # [B, 1, N, N] → [B, N, N]
+                    attn_mask = attention_mask[:, 0]
 
             from cuequivariance_torch import triangle_multiplicative_update
             pair_repr = triangle_multiplicative_update(
                 x=pair_repr,
                 direction="outgoing",  # or "incoming"
                 mask=attn_mask,
+                norm_in_weight=self.norm_in.weight,
+                norm_in_bias=self.norm_in.bias,
+                p_in_weight=self.p_in.weight,
+                g_in_weight=self.g_in.weight,
+                norm_out_weight=self.norm_out.weight,
+                norm_out_bias=self.norm_out.bias,
+                p_out_weight=self.p_out.weight,
+                g_out_weight=self.g_out.weight,
+                eps=1e-5,
             )
             pair_repr = triangle_multiplicative_update(
                 x=pair_repr,
                 direction="incoming",  # or "outgoing"
                 mask=attn_mask,
+                norm_in_weight=self.norm_in.weight,
+                norm_in_bias=self.norm_in.bias,
+                p_in_weight=self.p_in.weight,
+                g_in_weight=self.g_in.weight,
+                norm_out_weight=self.norm_out.weight,
+                norm_out_bias=self.norm_out.bias,
+                p_out_weight=self.p_out.weight,
+                g_out_weight=self.g_out.weight,
+                eps=1e-5,
             )
 
         # --- Pair → Residue projection ---
@@ -449,3 +493,55 @@ def create_triangular_attention_layer(
         num_heads=num_heads,
         dropout=dropout
     )
+
+def bias_init_one_(bias):
+    with torch.no_grad():
+        bias.fill_(1.0)
+        
+def bias_init_zero_(bias):
+    with torch.no_grad():
+        bias.fill_(0.0)
+        
+def lecun_normal_init_(weights):
+    trunc_normal_init_(weights, scale=1.0)
+    
+def trunc_normal_init_(weights, scale=1.0, fan="fan_in"):
+    shape = weights.shape
+    f = _calculate_fan(shape, fan)
+    scale = scale / max(1, f)
+    a = -2
+    b = 2
+    std = math.sqrt(scale) / truncnorm.std(a=a, b=b, loc=0, scale=1)
+    size = _prod(shape)
+    samples = truncnorm.rvs(a=a, b=b, loc=0, scale=std, size=size)
+    samples = np.reshape(samples, shape)
+    with torch.no_grad():
+        weights.copy_(torch.tensor(samples, device=weights.device))
+
+def gating_init_(weights):
+    with torch.no_grad():
+        weights.fill_(0.0)
+        
+def _calculate_fan(linear_weight_shape, fan="fan_in"):
+    fan_out, fan_in = linear_weight_shape
+
+    if fan == "fan_in":
+        f = fan_in
+    elif fan == "fan_out":
+        f = fan_out
+    elif fan == "fan_avg":
+        f = (fan_in + fan_out) / 2
+    else:
+        raise ValueError("Invalid fan option")
+
+    return f
+
+def _prod(nums):
+    out = 1
+    for n in nums:
+        out = out * n
+    return out
+
+def final_init_(weights):
+    with torch.no_grad():
+        weights.fill_(0.0)
