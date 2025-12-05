@@ -16,6 +16,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
 from scipy.stats import truncnorm
+from nanoplm.models.student.positional_encoding import RelativePositionEncoding
+import random
 
 class TriangularSelfAttention(nn.Module):
     """
@@ -285,7 +287,8 @@ class PairwiseTriangularBlock(nn.Module):
         pair_dim: int,
         num_heads: int = 8,
         dropout: float = 0.1,
-        use_multiplication: bool = True
+        use_multiplication: bool = True,
+        use_positional_encoding: bool = False
     ):
         super().__init__()
         
@@ -295,6 +298,7 @@ class PairwiseTriangularBlock(nn.Module):
         self.head_dim = pair_dim // num_heads
         self.dropout = dropout
         self.use_multiplication = use_multiplication
+        self.use_positional_encoding = use_positional_encoding
         
         if not self.use_multiplication:
 
@@ -333,6 +337,13 @@ class PairwiseTriangularBlock(nn.Module):
 
             final_init_(self.p_out.weight)
             gating_init_(self.g_out.weight)
+            
+            if self.use_positional_encoding:
+                self.relpos = RelativePositionEncoding(
+                    r_max=32,
+                    s_max=2,
+                    dim_out=pair_dim
+                )
 
         # --- Residue → Pair projections (AlphaFold-style) ---
         self.residue_to_pair_left = nn.Linear(residue_dim, pair_dim)
@@ -377,13 +388,13 @@ class PairwiseTriangularBlock(nn.Module):
 
         # Initialize pair representation if missing
         if pair_repr is None:
-            pair_repr = self._create_pair_representation(residue_repr)
+            pair_repr = self._create_pair_representation(residue_repr, self.use_positional_encoding)
         
         if not self.use_multiplication:
 
             # --- Triangular attention updates ---
-            pair_repr = self.tri_attn_row(pair_repr, attention_mask=attention_mask, ta_layer_num=ta_layer_num) # already includes norm & gating
-            pair_repr = self.tri_attn_col(pair_repr, attention_mask=attention_mask, ta_layer_num=ta_layer_num+1) # already includes norm & gating
+            pair_repr = pair_repr + self.tri_attn_row(pair_repr, attention_mask=attention_mask, ta_layer_num=ta_layer_num) # already includes norm & gating
+            pair_repr = pair_repr + self.tri_attn_col(pair_repr, attention_mask=attention_mask, ta_layer_num=ta_layer_num+1) # already includes norm & gating
         
         else:
             attn_mask = None
@@ -398,7 +409,7 @@ class PairwiseTriangularBlock(nn.Module):
                     attn_mask = attention_mask[:, 0]
 
             from cuequivariance_torch import triangle_multiplicative_update
-            pair_repr = triangle_multiplicative_update(
+            pair_repr = pair_repr + triangle_multiplicative_update(
                 x=pair_repr,
                 direction="outgoing",  # or "incoming"
                 mask=attn_mask,
@@ -412,7 +423,7 @@ class PairwiseTriangularBlock(nn.Module):
                 g_out_weight=self.g_out.weight,
                 eps=1e-5,
             )
-            pair_repr = triangle_multiplicative_update(
+            pair_repr = pair_repr + triangle_multiplicative_update(
                 x=pair_repr,
                 direction="incoming",  # or "outgoing"
                 mask=attn_mask,
@@ -438,8 +449,8 @@ class PairwiseTriangularBlock(nn.Module):
 
         return residue_repr, pair_repr_normed
 
-    
-    def _create_pair_representation(self, residue_repr: torch.Tensor) -> torch.Tensor:
+
+    def _create_pair_representation(self, residue_repr: torch.Tensor, use_positional_encoding: bool) -> torch.Tensor:
         """
         AlphaFold-style pair representation:
         pair[i,j] = linear_left(res_i) + linear_right(res_j)
@@ -451,6 +462,16 @@ class PairwiseTriangularBlock(nn.Module):
             Pair representation (B, N, N, pair_dim)
         """
         B, N, residue_dim = residue_repr.shape
+        if use_positional_encoding:
+            device = residue_repr.device
+            pair_repr = self.relpos(
+                batch_size=B,
+                seq_len=N,
+                device=device,
+                complex_chain_break_indices=None
+            )
+            pair_repr = pair_repr.to(torch.bfloat16)
+            return pair_repr
 
         left_proj = self.residue_to_pair_left(residue_repr)      # (B, N, pair_dim)
         right_proj = self.residue_to_pair_right(residue_repr)    # (B, N, pair_dim)

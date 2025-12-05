@@ -39,6 +39,9 @@ class ProtModernBertMLM(nn.Module):
         config: ProtModernBertMLMConfig
     ):
         super().__init__()
+        self._keys_to_ignore_on_save = set()
+        self._keys_to_ignore_on_load_missing = set()
+        self._keys_to_ignore_on_load_unexpected = set()
         
         self.tokenizer = ProtModernBertTokenizer()
         self.use_triangular_attention = config.use_triangular_attention
