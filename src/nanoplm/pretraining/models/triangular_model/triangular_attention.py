@@ -454,7 +454,7 @@ class PairwiseTriangularBlock(nn.Module):
         
         # Compute sequence stack
         with torch.autocast("cuda", enabled=False):
-            residue_repr_normed = self.pre_norm_s(residue_repr.float())
+            residue_repr_normed = self.pre_norm_residue(residue_repr.float())
             residue_repr = residue_repr.float() + self.attention(
                 s=residue_repr_normed, z=pair_repr.float(), mask=attention_mask.float(), k_in=residue_repr_normed
             )
