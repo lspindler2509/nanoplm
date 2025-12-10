@@ -450,18 +450,18 @@ class PairwiseTriangularBlock(nn.Module):
             )
 
         # Transition layer on pair representations (like Boltz - applied before attention bias)
-        pair_repr = pair_repr + self.transition_z(pair_repr)
+        pair_repr = (pair_repr + self.transition_z(pair_repr)).to(torch.bfloat16)
         
         # Compute sequence stack
         with torch.autocast("cuda", enabled=False):
             residue_repr_normed = self.pre_norm_s(residue_repr.float())
-            s = s.float() + self.attention(
+            residue_repr = residue_repr.float() + self.attention(
                 s=residue_repr_normed, z=pair_repr.float(), mask=attention_mask.float(), k_in=residue_repr_normed
             )
-            residue_repr = residue_repr + self.transition_s(residue_repr)
-            residue_repr = self.s_post_norm(residue_repr)
+            residue_repr = (residue_repr + self.transition_s(residue_repr)).to(torch.bfloat16)
+            residue_repr = self.s_post_norm(residue_repr).to(torch.bfloat16)
         
-        return residue_repr.to(torch.bfloat16), pair_repr.to(torch.bfloat16)
+        return residue_repr, pair_repr
 
 
     def _create_pair_representation(self, residue_repr: torch.Tensor, use_positional_encoding: bool) -> torch.Tensor:
