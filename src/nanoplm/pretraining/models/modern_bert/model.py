@@ -6,7 +6,7 @@ from transformers.modeling_outputs import MaskedLMOutput
 
 from transformers import ModernBertConfig, ModernBertForMaskedLM
 from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
-from nanoplm.pretraining.models.modern_bert.model_withTriangularAttention import ModernBertForMaskedLMWithTriangularAttention
+from nanoplm.pretraining.models.triangular_model.model_withTriangularAttention import ModernBertForMaskedLMWithTriangularAttention
 
 @dataclass
 class ProtModernBertMLMConfig:
