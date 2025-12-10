@@ -10,14 +10,17 @@ high-performance triangular attention operations.
 
 import sys
 import math
+from nanoplm.pretraining.models.triangular_model.attention import AttentionPairBias
+from nanoplm.pretraining.models.triangular_model.transition import Transition
 import torch
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
 from scipy.stats import truncnorm
-from nanoplm.models.student.positional_encoding import RelativePositionEncoding
-import random
+from nanoplm.pretraining.models.triangular_model.positional_encoding import RelativePositionEncoding
+from einops.layers.torch import Rearrange
+import nanoplm.pretraining.models.triangular_model.initialize as init
 
 class TriangularSelfAttention(nn.Module):
     """
@@ -288,7 +291,8 @@ class PairwiseTriangularBlock(nn.Module):
         num_heads: int = 8,
         dropout: float = 0.1,
         use_multiplication: bool = True,
-        use_positional_encoding: bool = False
+        use_positional_encoding: bool = False,
+        num_attention_heads: Optional[int] = None  # For residue attention
     ):
         super().__init__()
         
@@ -299,6 +303,19 @@ class PairwiseTriangularBlock(nn.Module):
         self.dropout = dropout
         self.use_multiplication = use_multiplication
         self.use_positional_encoding = use_positional_encoding
+        
+        # Number of attention heads for residue attention (default: residue_dim // 64)
+        if num_attention_heads is None:
+            num_attention_heads = max(1, residue_dim // 64)
+        self.num_attention_heads = num_attention_heads
+        
+        # Ensure residue_dim is divisible by num_attention_heads
+        if residue_dim % num_attention_heads != 0:
+            raise ValueError(
+                f"residue_dim ({residue_dim}) must be divisible by num_attention_heads ({num_attention_heads})"
+            )
+        self.residue_head_dim = residue_dim // num_attention_heads
+        self.pre_norm_residue = nn.LayerNorm(residue_dim)
         
         if not self.use_multiplication:
 
@@ -326,34 +343,34 @@ class PairwiseTriangularBlock(nn.Module):
             self.p_out = nn.Linear(pair_dim, pair_dim, bias=False)
             self.g_out = nn.Linear(pair_dim, pair_dim, bias=False)
 
-            bias_init_one_(self.norm_in.weight)
-            bias_init_zero_(self.norm_in.bias)
+            init.bias_init_one_(self.norm_in.weight)
+            init.bias_init_zero_(self.norm_in.bias)
 
-            lecun_normal_init_(self.p_in.weight)
-            gating_init_(self.g_in.weight)
+            init.lecun_normal_init_(self.p_in.weight)
+            init.gating_init_(self.g_in.weight)
 
-            bias_init_one_(self.norm_out.weight)
-            bias_init_zero_(self.norm_out.bias)
+            init.bias_init_one_(self.norm_out.weight)
+            init.bias_init_zero_(self.norm_out.bias)
 
-            final_init_(self.p_out.weight)
-            gating_init_(self.g_out.weight)
+            init.final_init_(self.p_out.weight)
+            init.gating_init_(self.g_out.weight)
             
-            if self.use_positional_encoding:
-                self.relpos = RelativePositionEncoding(
-                    r_max=32,
-                    s_max=2,
-                    dim_out=pair_dim
-                )
+        if self.use_positional_encoding:
+            self.relpos = RelativePositionEncoding(
+                r_max=32,
+                s_max=2,
+                dim_out=pair_dim
+            )
 
         # --- Residue → Pair projections (AlphaFold-style) ---
         self.residue_to_pair_left = nn.Linear(residue_dim, pair_dim)
         self.residue_to_pair_right = nn.Linear(residue_dim, pair_dim)
 
-        # --- Pair → Residue projection ---
-        self.pair_to_residue = nn.Linear(pair_dim, residue_dim)
-
-        # --- Normalizations & gating ---
-        self.norm_pair_to_residue = nn.LayerNorm(pair_dim)
+        self.attention = AttentionPairBias(residue_dim, pair_dim, num_heads)
+        
+        self.transition_z = Transition(pair_dim, pair_dim * 4)
+        self.transition_s = Transition(residue_dim, residue_dim * 4)
+        self.s_post_norm = nn.LayerNorm(residue_dim)
 
         self._init_weights()
 
@@ -364,10 +381,7 @@ class PairwiseTriangularBlock(nn.Module):
         nn.init.xavier_uniform_(self.residue_to_pair_right.weight)
         nn.init.zeros_(self.residue_to_pair_right.bias)
 
-        nn.init.xavier_uniform_(self.pair_to_residue.weight, gain=0.2)
-        nn.init.zeros_(self.pair_to_residue.bias)
-
-        print("✅ PairwiseTriangularBlock initialized (learnable mixing + conservative scaling)")
+        print("✅ PairwiseTriangularBlock initialized")
 
     def forward(
         self,
@@ -384,8 +398,6 @@ class PairwiseTriangularBlock(nn.Module):
             pair_repr: Optional (B, N, N, pair_dim)
             attention_mask: Optional (B, N, N)
         """
-        B, N, _ = residue_repr.shape
-
         # Initialize pair representation if missing
         if pair_repr is None:
             pair_repr = self._create_pair_representation(residue_repr, self.use_positional_encoding)
@@ -402,7 +414,6 @@ class PairwiseTriangularBlock(nn.Module):
                 if attention_mask.dtype != torch.bool:
                     attention_mask = attention_mask.bool()
                 if attention_mask.dim() == 2:
-                    B_mask, N_mask = attention_mask.shape
                     attn_mask = attention_mask.unsqueeze(2) & attention_mask.unsqueeze(1)  # (B, N, N)
                 elif attention_mask.dim() == 4:
                     # [B, 1, N, N] → [B, N, N]
@@ -438,16 +449,19 @@ class PairwiseTriangularBlock(nn.Module):
                 eps=1e-5,
             )
 
-        # --- Pair → Residue projection ---
-        pair_repr_normed = self.norm_pair_to_residue(pair_repr).to(torch.bfloat16)
-        aggregated_info = pair_repr_normed.mean(dim=2)
+        # Transition layer on pair representations (like Boltz - applied before attention bias)
+        pair_repr = pair_repr + self.transition_z(pair_repr)
         
-        updated_residue = self.pair_to_residue(aggregated_info)
-
-        # --- Residual update ---
-        residue_repr = residue_repr + updated_residue
-
-        return residue_repr, pair_repr_normed
+        # Compute sequence stack
+        with torch.autocast("cuda", enabled=False):
+            residue_repr_normed = self.pre_norm_s(residue_repr.float())
+            s = s.float() + self.attention(
+                s=residue_repr_normed, z=pair_repr.float(), mask=attention_mask.float(), k_in=residue_repr_normed
+            )
+            residue_repr = residue_repr + self.transition_s(residue_repr)
+            residue_repr = self.s_post_norm(residue_repr)
+        
+        return residue_repr.to(torch.bfloat16), pair_repr.to(torch.bfloat16)
 
 
     def _create_pair_representation(self, residue_repr: torch.Tensor, use_positional_encoding: bool) -> torch.Tensor:
@@ -486,7 +500,8 @@ def create_triangular_attention_layer(
     residue_dim: int,
     pair_dim: Optional[int] = None,
     num_heads: Optional[int] = None,
-    dropout: float = 0.1
+    dropout: float = 0.1,
+    num_attention_heads: Optional[int] = None
 ) -> PairwiseTriangularBlock:
     """
     Factory function to create a triangular attention layer.
@@ -494,8 +509,9 @@ def create_triangular_attention_layer(
     Args:
         residue_dim: Dimension of residue representations
         pair_dim: Dimension of pair representations (default: residue_dim)
-        num_heads: Number of attention heads (default: 8)
+        num_heads: Number of attention heads for triangular attention (default: 8)
         dropout: Dropout rate
+        num_attention_heads: Number of attention heads for residue attention (default: residue_dim // 64)
         
     Returns:
         PairwiseTriangularBlock instance
@@ -506,63 +522,12 @@ def create_triangular_attention_layer(
     if num_heads is None:
         num_heads = 8
     
-    print(f"🔧 Creating Triangular Attention Layer: residue_dim={residue_dim}, pair_dim={pair_dim}, num_heads={num_heads}, dropout={dropout}")
+    print(f"🔧 Creating Triangular Attention Layer: residue_dim={residue_dim}, pair_dim={pair_dim}, num_heads={num_heads}, dropout={dropout}, num_attention_heads={num_attention_heads}")
         
     return PairwiseTriangularBlock(
         residue_dim=residue_dim,
         pair_dim=pair_dim,
         num_heads=num_heads,
-        dropout=dropout
+        dropout=dropout,
+        num_attention_heads=num_attention_heads
     )
-
-def bias_init_one_(bias):
-    with torch.no_grad():
-        bias.fill_(1.0)
-        
-def bias_init_zero_(bias):
-    with torch.no_grad():
-        bias.fill_(0.0)
-        
-def lecun_normal_init_(weights):
-    trunc_normal_init_(weights, scale=1.0)
-    
-def trunc_normal_init_(weights, scale=1.0, fan="fan_in"):
-    shape = weights.shape
-    f = _calculate_fan(shape, fan)
-    scale = scale / max(1, f)
-    a = -2
-    b = 2
-    std = math.sqrt(scale) / truncnorm.std(a=a, b=b, loc=0, scale=1)
-    size = _prod(shape)
-    samples = truncnorm.rvs(a=a, b=b, loc=0, scale=std, size=size)
-    samples = np.reshape(samples, shape)
-    with torch.no_grad():
-        weights.copy_(torch.tensor(samples, device=weights.device))
-
-def gating_init_(weights):
-    with torch.no_grad():
-        weights.fill_(0.0)
-        
-def _calculate_fan(linear_weight_shape, fan="fan_in"):
-    fan_out, fan_in = linear_weight_shape
-
-    if fan == "fan_in":
-        f = fan_in
-    elif fan == "fan_out":
-        f = fan_out
-    elif fan == "fan_avg":
-        f = (fan_in + fan_out) / 2
-    else:
-        raise ValueError("Invalid fan option")
-
-    return f
-
-def _prod(nums):
-    out = 1
-    for n in nums:
-        out = out * n
-    return out
-
-def final_init_(weights):
-    with torch.no_grad():
-        weights.fill_(0.0)

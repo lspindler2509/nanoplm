@@ -5,7 +5,7 @@ from transformers import ModernBertConfig, ModernBertPreTrainedModel, ModernBert
 from transformers.modeling_outputs import BaseModelOutput
 from transformers.utils import logging
 from nanoplm.pretraining.models.modern_bert.activations import ACT2FN
-from nanoplm.models.student.triangular_attention import create_triangular_attention_layer
+from nanoplm.pretraining.models.triangular_model.triangular_attention import create_triangular_attention_layer
 from transformers.modeling_outputs import MaskedLMOutput
 import torch.nn.functional as F
 import math
@@ -229,6 +229,7 @@ class ModernBertModelWithTriangularAttention(ModernBertPreTrainedModel):
                     pair_dim=triangular_pair_dim or config.hidden_size,
                     num_heads=triangular_heads or 4,
                     dropout=triangular_dropout or 0.1,
+                    num_attention_heads=config.num_attention_heads,
                 )
                 self.layers.append(tri_block)
         self.final_norm = nn.LayerNorm(config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
