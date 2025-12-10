@@ -116,16 +116,15 @@ class AttentionPairBias(nn.Module):
 
         g = self.proj_g(s).sigmoid()
 
-        with torch.autocast("cuda", enabled=False):
-            # Compute attention weights
-            attn = torch.einsum("bihd,bjhd->bhij", q.float(), k.float())
-            attn = attn / (self.head_dim**0.5) + z.float()
-            # The pairwise mask tensor (B, N) is broadcasted to (B, 1, 1, N) and (B, H, N, N)
-            attn = attn + (1 - mask[:, None, None].float()) * -self.inf
-            attn = attn.softmax(dim=-1)
+        # Compute attention weights (all in bfloat16)
+        attn = torch.einsum("bihd,bjhd->bhij", q, k)
+        attn = attn / (self.head_dim**0.5) + z
+        # The pairwise mask tensor (B, N) is broadcasted to (B, 1, 1, N) and (B, H, N, N)
+        attn = attn + (1 - mask[:, None, None]) * -self.inf
+        attn = attn.softmax(dim=-1)
 
-            # Compute output
-            o = torch.einsum("bhij,bjhd->bihd", attn, v.float()).to(v.dtype)
+        # Compute output
+        o = torch.einsum("bhij,bjhd->bihd", attn, v)
         o = o.reshape(B, -1, self.c_s)
         o = self.proj_o(g * o)
 
