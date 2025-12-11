@@ -22,6 +22,7 @@ from nanoplm.pretraining.dataset import (
     LoadShardedFastaMLMDataset,
 )
 from nanoplm.pretraining.collator import ProtDataCollatorForLM
+from nanoplm.pretraining.callbacks import ParameterLoggingCallback
 from nanoplm.utils.logger import logger
 from nanoplm.utils.common import get_device, create_dirs
 
@@ -310,6 +311,23 @@ def run_pretraining(
 
     args = TrainingArguments(**training_dict)
 
+    # Find triangular attention layer parameters to log
+    param_names_to_log = []
+    for name, param in model.named_parameters():
+        # Log p_out.weight and proj_o.weight from triangular layers
+        if 'p_out.weight' in name or 'proj_o.weight' in name:
+            param_names_to_log.append(name)
+    
+    # Create callback for parameter logging
+    callbacks = []
+    if param_names_to_log:
+        logger.info(f"Will log {len(param_names_to_log)} parameters to WandB: {param_names_to_log[:3]}...")
+        param_callback = ParameterLoggingCallback(
+            parameter_names=param_names_to_log,
+            log_every_n_steps=logging_steps  # Log at same frequency as other metrics
+        )
+        callbacks.append(param_callback)
+
     trainer = Trainer(
         model=model,
         args=args,
@@ -317,6 +335,7 @@ def run_pretraining(
         train_dataset=train_ds,
         eval_dataset=val_ds,
         processing_class=tokenizer,
+        callbacks=callbacks if callbacks else None,
     )
 
     logger.info("Starting Trainer")
