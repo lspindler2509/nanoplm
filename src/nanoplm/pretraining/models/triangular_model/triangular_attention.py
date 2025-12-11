@@ -18,7 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
 from scipy.stats import truncnorm
-from nanoplm.pretraining.models.triangular_model.positional_encoding import RelativePositionEncoding
+from nanoplm.pretraining.models.triangular_model.positional_encoding import RelativePositionEncoder
 from einops.layers.torch import Rearrange
 import nanoplm.pretraining.models.triangular_model.initialize as init
 
@@ -291,7 +291,7 @@ class PairwiseTriangularBlock(nn.Module):
         num_heads: int = 8,
         dropout: float = 0.1,
         use_multiplication: bool = True,
-        use_positional_encoding: bool = False,
+        use_positional_encoding: bool = True,
         num_attention_heads: Optional[int] = None  # For residue attention
     ):
         super().__init__()
@@ -356,32 +356,22 @@ class PairwiseTriangularBlock(nn.Module):
             init.gating_init_(self.g_out.weight)
             
         if self.use_positional_encoding:
-            self.relpos = RelativePositionEncoding(
-                r_max=32,
-                s_max=2,
-                dim_out=pair_dim
+            self.relpos = RelativePositionEncoder(
+                token_z=pair_dim,
+                fix_sym_check=False,
+                cyclic_pos_enc=False
             )
+            self.token_bonds = nn.Linear(1, pair_dim, bias=False)
 
         # --- Residue → Pair projections (AlphaFold-style) ---
-        self.residue_to_pair_left = nn.Linear(residue_dim, pair_dim)
-        self.residue_to_pair_right = nn.Linear(residue_dim, pair_dim)
+        self.residue_to_pair_left = nn.Linear(residue_dim, pair_dim, bias=False)
+        self.residue_to_pair_right = nn.Linear(residue_dim, pair_dim, bias=False)
 
         self.attention = AttentionPairBias(residue_dim, pair_dim, num_heads)
         
         self.transition_z = Transition(pair_dim, pair_dim * 4)
         self.transition_s = Transition(residue_dim, residue_dim * 4)
         self.s_post_norm = nn.LayerNorm(residue_dim)
-
-        self._init_weights()
-
-    def _init_weights(self):
-        """Initialize weights conservatively to avoid gradient explosions."""
-        nn.init.xavier_uniform_(self.residue_to_pair_left.weight)
-        nn.init.zeros_(self.residue_to_pair_left.bias)
-        nn.init.xavier_uniform_(self.residue_to_pair_right.weight)
-        nn.init.zeros_(self.residue_to_pair_right.bias)
-
-        print("✅ PairwiseTriangularBlock initialized")
 
     def forward(
         self,
@@ -474,25 +464,31 @@ class PairwiseTriangularBlock(nn.Module):
         Returns:
             Pair representation (B, N, N, pair_dim)
         """
-        B, N, residue_dim = residue_repr.shape
-        if use_positional_encoding:
-            device = residue_repr.device
-            pair_repr = self.relpos(
-                batch_size=B,
-                seq_len=N,
-                device=device,
-                complex_chain_break_indices=None
+        B, N, _ = residue_repr.shape
+        device = residue_repr.device
+
+        pair_repr = (
+                self.residue_to_pair_left(residue_repr)[:, :, None]
+                + self.residue_to_pair_right(residue_repr)[:, None, :]
             )
-            pair_repr = pair_repr.to(torch.bfloat16)
-            return pair_repr
 
-        left_proj = self.residue_to_pair_left(residue_repr)      # (B, N, pair_dim)
-        right_proj = self.residue_to_pair_right(residue_repr)    # (B, N, pair_dim)
+        if use_positional_encoding:
+            # Create feats dict for RelativePositionEncoder
+            # For single-chain sequences, we set most values to constants
+            residue_index = torch.arange(N, device=device).unsqueeze(0).expand(B, -1)  # (B, N): 0, 1, 2, ..., N-1
+            
+            feats = {
+                "asym_id": torch.zeros(B, N, device=device),  # All in chain 0
+                "residue_index": residue_index,  # 0, 1, 2, ..., N-1
+                "entity_id": torch.zeros(B, N, device=device),  # All in entity 0
+                "token_index": residue_index,  # Same as residue_index (1 token = 1 residue)
+                "sym_id": torch.zeros(B, N, device=device),  # No symmetry
+                "cyclic_period": torch.zeros(B, N, device=device),  # No cyclic proteins
+            }
+            
+            pair_repr = pair_repr + self.relpos(feats).to(torch.bfloat16)
 
-        # Broadcast + addition (AlphaFold)
-        pair = left_proj.unsqueeze(2) + right_proj.unsqueeze(1)  # (B, N, N, pair_dim)
-
-        return pair
+        return pair_repr
 
 
 def create_triangular_attention_layer(
