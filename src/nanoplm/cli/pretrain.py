@@ -112,7 +112,19 @@ def pretrain():
     "--warmup-ratio",
     type=float,
     default=0.05,
-    help="Warmup ratio"
+    help="Warmup ratio (percentage of total steps). Ignored if --warmup-steps is set."
+)
+@click.option(
+    "--warmup-steps",
+    type=int,
+    default=None,
+    help="Absolute number of warmup steps. Takes priority over --warmup-ratio if set."
+)
+@click.option(
+    "--lr-scheduler-type",
+    type=click.Choice(["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"], case_sensitive=False),
+    default="linear",
+    help="Learning rate scheduler type"
 )
 @click.option(
     "--optimizer",
@@ -306,6 +318,8 @@ def run(
     weight_decay: float,
     max_grad_norm: float,
     warmup_ratio: float,
+    warmup_steps: Optional[int],
+    lr_scheduler_type: str,
     optimizer: str,
     adam_beta1: float,
     adam_beta2: float,
@@ -355,6 +369,8 @@ def run(
         weight_decay=weight_decay,
         max_grad_norm=max_grad_norm,
         warmup_ratio=warmup_ratio,
+        warmup_steps=warmup_steps,
+        lr_scheduler_type=lr_scheduler_type,
         optimizer=optimizer,
         adam_beta1=adam_beta1,
         adam_beta2=adam_beta2,
@@ -543,7 +559,9 @@ def get_yaml(output: Optional[str], force: bool):
         "  adam_beta2: 0.999\n"
         "  adam_epsilon: 1e-8\n"
         "  learning_rate: 1e-3\n # This is the maximum learning in the warmup phase \n"
-        "  warmup_ratio: 0.05\n"
+        "  warmup_ratio: 0.05  # Percentage of total steps (ignored if warmup_steps is set)\n"
+        "  # warmup_steps: 200  # Optional: Absolute number of warmup steps (takes priority over warmup_ratio)\n"
+        "  lr_scheduler_type: \"linear\"  # Options: linear, cosine, cosine_with_restarts, polynomial, constant, constant_with_warmup\n"
         "  weight_decay: 0.0\n"
         "  max_grad_norm: 1.0  # Gradient clipping for stability\n"
         "  gradient_accumulation_steps: 1\n"

@@ -40,6 +40,8 @@ class PretrainingConfig:
     val_hdf5: str = "output/data/split/val_hdf5"
     load_all_in_memory: bool = False
     warmup_ratio: float = 0.05
+    warmup_steps: Optional[int] = None  # If set, takes priority over warmup_ratio
+    lr_scheduler_type: str = "linear"  # Options: "linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"
     optimizer: str = "adamw"
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
@@ -263,6 +265,13 @@ def run_pretraining(
 
     num_workers = _get_num_workers(pretrain_config.num_workers, effective_world_size)
 
+    # Determine warmup: warmup_steps takes priority over warmup_ratio
+    warmup_config = {}
+    if pretrain_config.warmup_steps is not None:
+        warmup_config["warmup_steps"] = pretrain_config.warmup_steps
+    else:
+        warmup_config["warmup_ratio"] = pretrain_config.warmup_ratio
+
     training_dict = {
         "output_dir": output_dir,
         "per_device_train_batch_size": pretrain_config.batch_size,
@@ -272,8 +281,9 @@ def run_pretraining(
         "learning_rate": pretrain_config.learning_rate,
         "weight_decay": pretrain_config.weight_decay,
         "max_grad_norm": pretrain_config.max_grad_norm,
-        "warmup_ratio": pretrain_config.warmup_ratio,
+        "lr_scheduler_type": pretrain_config.lr_scheduler_type,
         "logging_strategy": "steps",
+        **warmup_config,  # Add warmup_steps or warmup_ratio
         "logging_steps": logging_steps,
         "logging_dir": Path(output_dir) / "logs",
         "eval_strategy": "steps",
