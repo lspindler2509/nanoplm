@@ -327,8 +327,7 @@ def run_pretraining(
     if param_names_to_log:
         logger.info(f"Will log {len(param_names_to_log)} parameters to WandB: {param_names_to_log[:3]}...")
         param_callback = ParameterLoggingCallback(
-            parameter_names=param_names_to_log,
-            log_every_n_steps=1
+            parameter_names=param_names_to_log
         )
         callbacks.append(param_callback)
 
