@@ -443,11 +443,11 @@ class PairwiseTriangularBlock(nn.Module):
         pair_repr = (pair_repr + self.transition_z(pair_repr)).to(torch.bfloat16)
         
         # Compute sequence stack
-        residue_repr_normed = self.pre_norm_residue(residue_repr)
+        residue_repr_normed = self.pre_norm_residue(residue_repr).to(torch.bfloat16)
         residue_repr = residue_repr + self.attention(
             s=residue_repr_normed, z=pair_repr, mask=attention_mask, k_in=residue_repr_normed
         )
-        residue_repr = residue_repr + self.transition_s(residue_repr)
+        residue_repr = residue_repr + self.transition_s(residue_repr).to(torch.bfloat16)
         residue_repr = self.s_post_norm(residue_repr).to(torch.bfloat16)
         
         return residue_repr, pair_repr
