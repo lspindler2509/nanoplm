@@ -475,15 +475,16 @@ class PairwiseTriangularBlock(nn.Module):
         if use_positional_encoding:
             # Create feats dict for RelativePositionEncoder
             # For single-chain sequences, we set most values to constants
-            residue_index = torch.arange(N, device=device).unsqueeze(0).expand(B, -1)  # (B, N): 0, 1, 2, ..., N-1
+            # Note: All indices must be torch.long for one_hot to work
+            residue_index = torch.arange(N, device=device, dtype=torch.long).unsqueeze(0).expand(B, -1)  # (B, N): 0, 1, 2, ..., N-1
             
             feats = {
-                "asym_id": torch.zeros(B, N, device=device),  # All in chain 0
+                "asym_id": torch.zeros(B, N, device=device, dtype=torch.long),  # All in chain 0
                 "residue_index": residue_index,  # 0, 1, 2, ..., N-1
-                "entity_id": torch.zeros(B, N, device=device),  # All in entity 0
+                "entity_id": torch.zeros(B, N, device=device, dtype=torch.long),  # All in entity 0
                 "token_index": residue_index,  # Same as residue_index (1 token = 1 residue)
-                "sym_id": torch.zeros(B, N, device=device),  # No symmetry
-                "cyclic_period": torch.zeros(B, N, device=device),  # No cyclic proteins
+                "sym_id": torch.zeros(B, N, device=device, dtype=torch.long),  # No symmetry
+                "cyclic_period": torch.zeros(B, N, device=device, dtype=torch.long),  # No cyclic proteins
             }
             
             pair_repr = pair_repr + self.relpos(feats).to(torch.bfloat16)
