@@ -314,8 +314,12 @@ def run_pretraining(
     # Find triangular attention layer parameters to log
     param_names_to_log = []
     for name, param in model.named_parameters():
-        # Log p_out.weight and proj_o.weight from triangular layers
-        if 'p_out.weight' in name or 'proj_o.weight' in name:
+        # Log key parameters from triangular attention layers:
+        # - p_out.weight: Output projection (controls update size, starts at 0)
+        # - proj_o.weight: Attention output projection (controls update size, starts at 0)
+        # - g_in.weight, g_out.weight: Gating parameters (controls gating strength, starts at 0)
+        # - proj_z: Pair-to-bias projection (controls Pair→Residue influence)
+        if any(key in name for key in ['p_out.weight', 'proj_o.weight', 'g_in.weight', 'g_out.weight', 'proj_z.1.weight']):
             param_names_to_log.append(name)
     
     # Create callback for parameter logging
@@ -324,7 +328,7 @@ def run_pretraining(
         logger.info(f"Will log {len(param_names_to_log)} parameters to WandB: {param_names_to_log[:3]}...")
         param_callback = ParameterLoggingCallback(
             parameter_names=param_names_to_log,
-            log_every_n_steps=logging_steps  # Log at same frequency as other metrics
+            log_every_n_steps=1
         )
         callbacks.append(param_callback)
 
