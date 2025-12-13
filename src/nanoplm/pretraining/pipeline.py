@@ -328,8 +328,13 @@ def run_pretraining(
         # - p_out.weight: Output projection (controls update size, starts at 0)
         # - proj_o.weight: Attention output projection (controls update size, starts at 0)
         # - g_in.weight, g_out.weight: Gating parameters (controls gating strength, starts at 0)
+        #   Now we have separate parameters for incoming and outgoing: tri_mult_incoming.* and tri_mult_outgoing.*
         # - proj_z: Pair-to-bias projection (controls Pair→Residue influence)
-        if any(key in name for key in ['p_out.weight', 'proj_o.weight', 'g_in.weight', 'g_out.weight', 'proj_z.1.weight']):
+        if any(key in name for key in [
+            'tri_mult_incoming.p_out.weight', 'tri_mult_incoming.g_in.weight', 'tri_mult_incoming.g_out.weight',
+            'tri_mult_outgoing.p_out.weight', 'tri_mult_outgoing.g_in.weight', 'tri_mult_outgoing.g_out.weight',
+            'proj_o.weight', 'proj_z.1.weight'
+        ]):
             param_names_to_log.append(name)
     
     # Create callback for parameter logging

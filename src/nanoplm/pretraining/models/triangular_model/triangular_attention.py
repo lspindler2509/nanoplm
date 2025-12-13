@@ -277,6 +277,82 @@ class TriangularSelfAttention(nn.Module):
             print(f"✅ cuEquivariance constraints met for 'tf32/fp32': {is_optimal_tf32} (hidden_dim={hidden_dim})'")
             print(f"✅ cuEquivariance constraints met for 'bf16/fp16': {is_optimal_bf16} (hidden_dim={hidden_dim})")
 
+
+class TriangularMultiplication(nn.Module):
+    """
+    Triangular multiplicative update module.
+    Encapsulates all parameters needed for one direction (incoming or outgoing).
+    """
+    
+    def __init__(
+        self,
+        pair_dim: int,
+        direction: str = "incoming"  # "incoming" or "outgoing"
+    ):
+        super().__init__()
+        self.pair_dim = pair_dim
+        self.direction = direction
+        
+        # Input normalization and projections
+        self.norm_in = nn.LayerNorm(pair_dim, eps=1e-5)
+        self.p_in = nn.Linear(pair_dim, 2 * pair_dim, bias=False)
+        self.g_in = nn.Linear(pair_dim, 2 * pair_dim, bias=False)
+        
+        # Output normalization and projections
+        self.norm_out = nn.LayerNorm(pair_dim)
+        self.p_out = nn.Linear(pair_dim, pair_dim, bias=False)
+        self.g_out = nn.Linear(pair_dim, pair_dim, bias=False)
+        
+        # Initialize weights
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize all weights for triangular multiplication."""
+        init.bias_init_one_(self.norm_in.weight)
+        init.bias_init_zero_(self.norm_in.bias)
+        
+        init.lecun_normal_init_(self.p_in.weight)
+        init.gating_init_(self.g_in.weight)
+        
+        init.bias_init_one_(self.norm_out.weight)
+        init.bias_init_zero_(self.norm_out.bias)
+        
+        init.final_init_(self.p_out.weight)
+        init.gating_init_(self.g_out.weight)
+    
+    def forward(
+        self,
+        pair_repr: torch.Tensor,
+        mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Forward pass of triangular multiplicative update.
+        
+        Args:
+            pair_repr: Pair representation tensor of shape (B, N, N, C)
+            mask: Optional attention mask of shape (B, N, N)
+            
+        Returns:
+            Updated pair representation of shape (B, N, N, C)
+        """
+        from cuequivariance_torch import triangle_multiplicative_update
+        
+        return triangle_multiplicative_update(
+            x=pair_repr,
+            direction=self.direction,
+            mask=mask,
+            norm_in_weight=self.norm_in.weight,
+            norm_in_bias=self.norm_in.bias,
+            p_in_weight=self.p_in.weight,
+            g_in_weight=self.g_in.weight,
+            norm_out_weight=self.norm_out.weight,
+            norm_out_bias=self.norm_out.bias,
+            p_out_weight=self.p_out.weight,
+            g_out_weight=self.g_out.weight,
+            eps=1e-5,
+        )
+
+
 class PairwiseTriangularBlock(nn.Module):
     """
     Pairwise triangular attention block combining row- and column-wise updates.
@@ -335,25 +411,9 @@ class PairwiseTriangularBlock(nn.Module):
                 orientation="per_column"
             )
         else:
-            self.norm_in = nn.LayerNorm(pair_dim, eps=1e-5)
-            self.p_in = nn.Linear(pair_dim, 2 * pair_dim, bias=False)
-            self.g_in = nn.Linear(pair_dim, 2 * pair_dim, bias=False)
-
-            self.norm_out = nn.LayerNorm(pair_dim)
-            self.p_out = nn.Linear(pair_dim, pair_dim, bias=False)
-            self.g_out = nn.Linear(pair_dim, pair_dim, bias=False)
-
-            init.bias_init_one_(self.norm_in.weight)
-            init.bias_init_zero_(self.norm_in.bias)
-
-            init.lecun_normal_init_(self.p_in.weight)
-            init.gating_init_(self.g_in.weight)
-
-            init.bias_init_one_(self.norm_out.weight)
-            init.bias_init_zero_(self.norm_out.bias)
-
-            init.final_init_(self.p_out.weight)
-            init.gating_init_(self.g_out.weight)
+            # Create separate triangular multiplication modules for incoming and outgoing
+            self.tri_mult_incoming = TriangularMultiplication(pair_dim, direction="incoming")
+            self.tri_mult_outgoing = TriangularMultiplication(pair_dim, direction="outgoing")
             
         if self.use_positional_encoding:
             self.relpos = RelativePositionEncoder(
@@ -409,35 +469,9 @@ class PairwiseTriangularBlock(nn.Module):
                     # [B, 1, N, N] → [B, N, N]
                     attn_mask = attention_mask[:, 0]
 
-            from cuequivariance_torch import triangle_multiplicative_update
-            pair_repr = pair_repr + triangle_multiplicative_update(
-                x=pair_repr,
-                direction="outgoing",  # or "incoming"
-                mask=attn_mask,
-                norm_in_weight=self.norm_in.weight,
-                norm_in_bias=self.norm_in.bias,
-                p_in_weight=self.p_in.weight,
-                g_in_weight=self.g_in.weight,
-                norm_out_weight=self.norm_out.weight,
-                norm_out_bias=self.norm_out.bias,
-                p_out_weight=self.p_out.weight,
-                g_out_weight=self.g_out.weight,
-                eps=1e-5,
-            )
-            pair_repr = pair_repr + triangle_multiplicative_update(
-                x=pair_repr,
-                direction="incoming",  # or "outgoing"
-                mask=attn_mask,
-                norm_in_weight=self.norm_in.weight,
-                norm_in_bias=self.norm_in.bias,
-                p_in_weight=self.p_in.weight,
-                g_in_weight=self.g_in.weight,
-                norm_out_weight=self.norm_out.weight,
-                norm_out_bias=self.norm_out.bias,
-                p_out_weight=self.p_out.weight,
-                g_out_weight=self.g_out.weight,
-                eps=1e-5,
-            )
+            # Apply outgoing update first, then incoming
+            pair_repr = pair_repr + self.tri_mult_outgoing(pair_repr, mask=attn_mask)
+            pair_repr = pair_repr + self.tri_mult_incoming(pair_repr, mask=attn_mask)
 
         # Transition layer on pair representations (like Boltz - applied before attention bias)
         pair_repr = (pair_repr + self.transition_z(pair_repr)).to(torch.bfloat16)
