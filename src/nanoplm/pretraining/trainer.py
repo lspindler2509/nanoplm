@@ -175,69 +175,90 @@ class PretrainingTrainer(Trainer):
                             if hasattr(self.optimizer, 'optimizer'):
                                 actual_optimizer = self.optimizer.optimizer
                             
-                            # Get current optimizer state to see what keys are expected
-                            current_state = actual_optimizer.state_dict()
-                            
-                            # Check for missing keys and initialize them
-                            missing_keys = []
-                            saved_state_dict = saved_state.get('state', {})
-                            current_state_dict = current_state.get('state', {})
-                            
-                            # Ensure 'state' key exists in saved_state
-                            if 'state' not in saved_state:
-                                saved_state['state'] = {}
-                            
-                            # Iterate through all parameters in current state
-                            for param_id_str, current_param_state in current_state_dict.items():
-                                saved_param_state = saved_state_dict.get(param_id_str, {})
-                                
-                                # Check for missing keys in this parameter's state
-                                for key in current_param_state.keys():
-                                    if key not in saved_param_state:
-                                        missing_keys.append((param_id_str, key))
-                                        
-                                        # Initialize missing key with appropriate dtype
-                                        if key == 'mean_square':
-                                            # mean_square must be float32 for stable_adamw Triton kernel
-                                            # Get shape from exp_avg_sq or exp_avg if available
-                                            ref_tensor = None
-                                            if 'exp_avg_sq' in saved_param_state:
-                                                ref_tensor = saved_param_state['exp_avg_sq']
-                                            elif 'exp_avg' in saved_param_state:
-                                                ref_tensor = saved_param_state['exp_avg']
-                                            elif 'exp_avg_sq' in current_param_state:
-                                                ref_tensor = current_param_state['exp_avg_sq']
-                                            elif 'exp_avg' in current_param_state:
-                                                ref_tensor = current_param_state['exp_avg']
-                                            
-                                            if ref_tensor is not None:
-                                                # mean_square is a scalar (0D tensor) for stable_adamw
-                                                saved_state['state'][param_id_str][key] = torch.tensor(
-                                                    0.0, dtype=torch.float32, device=ref_tensor.device
-                                                )
-                                            else:
-                                                # Fallback: create scalar tensor
-                                                saved_state['state'][param_id_str][key] = torch.tensor(
-                                                    0.0, dtype=torch.float32
-                                                )
-                                            logger.info(
-                                                f"Initializing missing 'mean_square' state for param {param_id_str} "
-                                                f"in float32 (required for stable_adamw Triton kernel)"
-                                            )
-                                        else:
-                                            # For other missing keys, use the current state's value
-                                            saved_state['state'][param_id_str][key] = current_param_state[key].clone()
-                                            logger.info(
-                                                f"Initializing missing '{key}' state for param {param_id_str}"
-                                            )
-                            
-                            if missing_keys:
+                            # First, try to load the state to see what happens
+                            # If it fails, we'll catch the error and fix missing keys
+                            try:
+                                actual_optimizer.load_state_dict(saved_state)
+                                logger.info("Successfully loaded optimizer state without missing keys.")
+                            except (KeyError, RuntimeError) as load_error:
+                                # If loading fails, we need to merge states manually
                                 logger.info(
-                                    f"Found {len(missing_keys)} missing state keys. Initialized them and loading partial state."
+                                    f"Optimizer state has missing keys. Merging with current state: {load_error}"
                                 )
-                            
-                            # Load the merged state
-                            self.optimizer.load_state_dict(saved_state)
+                                
+                                # Get current optimizer state to see what keys are expected
+                                current_state = actual_optimizer.state_dict()
+                                
+                                # Check for missing keys and initialize them
+                                missing_keys = []
+                                saved_state_dict = saved_state.get('state', {})
+                                current_state_dict = current_state.get('state', {})
+                                
+                                # Ensure 'state' key exists in saved_state
+                                if 'state' not in saved_state:
+                                    saved_state['state'] = {}
+                                
+                                # Iterate through all parameters in saved state
+                                for param_id_str in saved_state_dict.keys():
+                                    saved_param_state = saved_state_dict.get(param_id_str, {})
+                                    
+                                    # If this param exists in current state, check for missing keys
+                                    if param_id_str in current_state_dict:
+                                        current_param_state = current_state_dict[param_id_str]
+                                        
+                                        # Check for missing keys in this parameter's state
+                                        for key in current_param_state.keys():
+                                            if key not in saved_param_state:
+                                                missing_keys.append((param_id_str, key))
+                                                
+                                                # Initialize missing key with appropriate dtype
+                                                if key == 'mean_square':
+                                                    # mean_square must be float32 for stable_adamw Triton kernel
+                                                    # Get device from existing state
+                                                    ref_tensor = None
+                                                    if 'exp_avg_sq' in saved_param_state:
+                                                        ref_tensor = saved_param_state['exp_avg_sq']
+                                                    elif 'exp_avg' in saved_param_state:
+                                                        ref_tensor = saved_param_state['exp_avg']
+                                                    
+                                                    if ref_tensor is not None:
+                                                        # mean_square is a scalar (0D tensor) for stable_adamw
+                                                        saved_state['state'][param_id_str][key] = torch.tensor(
+                                                            0.0, dtype=torch.float32, device=ref_tensor.device
+                                                        )
+                                                    else:
+                                                        # Fallback: create scalar tensor on CPU, will be moved by optimizer
+                                                        saved_state['state'][param_id_str][key] = torch.tensor(
+                                                            0.0, dtype=torch.float32
+                                                        )
+                                                    logger.info(
+                                                        f"Initializing missing 'mean_square' state for param {param_id_str} "
+                                                        f"in float32 (required for stable_adamw Triton kernel)"
+                                                    )
+                                                else:
+                                                    # For other missing keys, use the current state's value
+                                                    saved_state['state'][param_id_str][key] = current_param_state[key].clone()
+                                                    logger.info(
+                                                        f"Initializing missing '{key}' state for param {param_id_str}"
+                                                    )
+                                
+                                if missing_keys:
+                                    logger.info(
+                                        f"Found {len(missing_keys)} missing state keys. Initialized them and loading merged state."
+                                    )
+                                
+                                # Now try loading the merged state
+                                actual_optimizer.load_state_dict(saved_state)
+                                
+                                # After loading, ensure mean_square is still float32 (in case optimizer changed it)
+                                for param_id_str, param_state in actual_optimizer.state.items():
+                                    if 'mean_square' in param_state:
+                                        if param_state['mean_square'].dtype != torch.float32:
+                                            logger.warning(
+                                                f"Converting 'mean_square' to float32 for param {param_id_str} "
+                                                f"(was {param_state['mean_square'].dtype})"
+                                            )
+                                            param_state['mean_square'] = param_state['mean_square'].to(dtype=torch.float32)
                             
                         except (KeyError, RuntimeError) as e:
                             logger.warning(
