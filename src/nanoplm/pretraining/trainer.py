@@ -11,8 +11,23 @@ import logging
 import warnings
 import os
 import glob
-from transformers.utils import is_torch_xla_available, is_sagemaker_mp_enabled, is_accelerate_available, is_deepspeed_available
+import importlib.metadata as importlib_metadata
+import importlib.util
+from transformers.utils import is_torch_xla_available, is_sagemaker_mp_enabled, is_accelerate_available
 from transformers.training_args import SCHEDULER_NAME, OPTIMIZER_NAME, OPTIMIZER_NAME_BIN
+
+
+def is_deepspeed_available():
+    package_exists = importlib.util.find_spec("deepspeed") is not None
+
+    # Check we're not importing a "deepspeed" directory somewhere but the actual library by trying to grab the version
+    # AND checking it has an author field in the metadata that is HuggingFace.
+    if package_exists:
+        try:
+            _ = importlib_metadata.metadata("deepspeed")
+            return True
+        except importlib_metadata.PackageNotFoundError:
+            return False
 if is_accelerate_available():
     from accelerate.utils import (
         load_fsdp_optimizer,
