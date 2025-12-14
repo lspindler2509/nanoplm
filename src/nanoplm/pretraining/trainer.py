@@ -117,10 +117,9 @@ class PretrainingTrainer(Trainer):
                 xm.send_cpu_data_to_device(
                     lr_scheduler_state, self.args.device)
 
-                # Try loading optimizer state with strict=False to handle missing keys
-                # (e.g., 'mean_square' for stable_adamw)
+                # Try loading optimizer state - handle missing keys (e.g., 'mean_square' for stable_adamw)
                 try:
-                    self.optimizer.load_state_dict(optimizer_state, strict=False)
+                    self.optimizer.load_state_dict(optimizer_state)
                 except (KeyError, RuntimeError) as e:
                     logger.warning(
                         f"Error loading optimizer state (likely missing state keys like "
@@ -134,7 +133,7 @@ class PretrainingTrainer(Trainer):
                     def opt_load_hook(mod, opt):
                         try:
                             opt.load_state_dict(smp.load(os.path.join(
-                                checkpoint, OPTIMIZER_NAME), partial=True), strict=False)
+                                checkpoint, OPTIMIZER_NAME), partial=True))
                         except (KeyError, RuntimeError) as e:
                             logger.warning(
                                 f"Error loading optimizer state (likely missing state keys like "
@@ -165,14 +164,12 @@ class PretrainingTrainer(Trainer):
                                 "Starting with fresh optimizer state."
                             )
                     else:
-                        # Try loading optimizer state with strict=False to handle missing keys
-                        # (e.g., 'mean_square' for stable_adamw)
+                        # Try loading optimizer state - handle missing keys (e.g., 'mean_square' for stable_adamw)
                         try:
                             self.optimizer.load_state_dict(
                                 torch.load(
                                     os.path.join(checkpoint, OPTIMIZER_NAME), map_location=map_location, weights_only=True
-                                ),
-                                strict=False
+                                )
                             )
                         except (KeyError, RuntimeError) as e:
                             logger.warning(
