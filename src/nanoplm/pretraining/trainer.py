@@ -129,9 +129,8 @@ class PretrainingTrainer(Trainer):
                     )
                 self.lr_scheduler.load_state_dict(lr_scheduler_state)
             else:
-                import smdistributed.modelparallel.torch as smp
                 if is_sagemaker_mp_enabled():
-
+                    import smdistributed.modelparallel.torch as smp
                     def opt_load_hook(mod, opt):
                         try:
                             opt.load_state_dict(smp.load(os.path.join(
