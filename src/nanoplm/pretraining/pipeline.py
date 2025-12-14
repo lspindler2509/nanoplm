@@ -9,9 +9,9 @@ from pathlib import Path
 
 from torch.utils.data import Dataset
 from transformers import (
-    Trainer,
     TrainingArguments,
 )
+from nanoplm.pretraining.trainer import PretrainingTrainer
 
 from nanoplm.pretraining.models.modern_bert import (
     ProtModernBertMLM,
@@ -346,7 +346,7 @@ def run_pretraining(
         )
         callbacks.append(param_callback)
 
-    trainer = Trainer(
+    trainer = PretrainingTrainer(
         model=model,
         args=args,
         data_collator=collator,
