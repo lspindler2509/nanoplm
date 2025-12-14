@@ -14,8 +14,10 @@ import glob
 import importlib.metadata as importlib_metadata
 import importlib.util
 from transformers.utils import is_torch_xla_available, is_sagemaker_mp_enabled, is_accelerate_available
-from transformers.training_args import SCHEDULER_NAME, OPTIMIZER_NAME, OPTIMIZER_NAME_BIN
 
+OPTIMIZER_NAME = "optimizer.pt"
+OPTIMIZER_NAME_BIN = "optimizer.bin"
+SCHEDULER_NAME = "scheduler.pt"
 
 def is_deepspeed_available():
     package_exists = importlib.util.find_spec("deepspeed") is not None
