@@ -657,14 +657,24 @@ def _load_model_config(config: Dict[str, Any]) -> ProtModernBertMLMConfig:
     expected_keys = set(ProtModernBertMLMConfig.__annotations__.keys())
     present_keys = set(config.keys())
 
-    # Define which keys are optional (triangular attention parameters)
+    # Define which keys are optional (triangular attention and recycling parameters)
     optional_keys = {
+        # Triangular attention parameters (only used if use_triangular_attention=True)
         'use_triangular_attention',
         'triangular_layers', 
         'triangular_pair_dim',
         'triangular_heads',
         'triangular_dropout', 
-        'triangular_mode'
+        'triangular_mode',
+        # Recycling parameters (only used if recycling=True)
+        'recycling',
+        'n_layers_in_prelude',
+        'n_layers_in_recurrent_block',
+        'n_layers_in_coda',
+        'mean_recurrence',
+        'backprop_depth',
+        'injection_type',
+        'sampling_scheme'
     }
     
     # Required keys are all keys except optional ones

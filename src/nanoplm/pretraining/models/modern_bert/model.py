@@ -7,6 +7,7 @@ from transformers.modeling_outputs import MaskedLMOutput
 from transformers import ModernBertConfig, ModernBertForMaskedLM
 from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
 from nanoplm.pretraining.models.triangular_model.model_withTriangularAttention import ModernBertForMaskedLMWithTriangularAttention
+from nanoplm.pretraining.models.triangular_model.model_with_recycling import ModernBertForMaskedLMWithRecycling
 
 @dataclass
 class ProtModernBertMLMConfig:
@@ -27,6 +28,15 @@ class ProtModernBertMLMConfig:
     triangular_pair_dim: Optional[int] = None
     triangular_heads: Optional[int] = None
     triangular_dropout: Optional[float] = None
+    # Recycling parameters (optional, only used if recycling=True)
+    recycling: bool = False
+    n_layers_in_prelude: Optional[int] = 4
+    n_layers_in_recurrent_block: Optional[int] = 8
+    n_layers_in_coda: Optional[int] = 4
+    mean_recurrence: Optional[int] = 4  # Average number of recycling iterations
+    backprop_depth: Optional[int] = 1  # Fixed number of iterations with gradients (not randomized)
+    injection_type: Optional[str] = "add"  # Options: "add", "gate", "linear", "ffn", "none"
+    sampling_scheme: Optional[str] = "uniform-0-4"  # Sampling scheme for num_steps_no_grad (uniform 0-4 recurrent steps)
 
 class ProtModernBertMLM(nn.Module):
     """
@@ -45,6 +55,39 @@ class ProtModernBertMLM(nn.Module):
         
         self.tokenizer = ProtModernBertTokenizer()
         self.use_triangular_attention = config.use_triangular_attention
+        self.recycling = config.recycling
+        
+        # Validate: only one of recycling or triangular_attention can be True
+        if self.recycling and self.use_triangular_attention:
+            raise ValueError(
+                "recycling and use_triangular_attention cannot both be True. "
+                "Please choose one: either recycling=True OR use_triangular_attention=True"
+            )
+        
+        # Validate recycling parameters (required only if recycling=True)
+        if self.recycling:
+            if config.n_layers_in_prelude is None or config.n_layers_in_recurrent_block is None or config.n_layers_in_coda is None:
+                raise ValueError(
+                    "When recycling=True, n_layers_in_prelude, n_layers_in_recurrent_block, "
+                    "and n_layers_in_coda must all be specified"
+                )
+            if config.mean_recurrence is None:
+                raise ValueError("When recycling=True, mean_recurrence must be specified")
+            if config.backprop_depth is None:
+                raise ValueError("When recycling=True, backprop_depth must be specified")
+            if config.injection_type is None:
+                raise ValueError("When recycling=True, injection_type must be specified")
+            if config.sampling_scheme is None:
+                raise ValueError("When recycling=True, sampling_scheme must be specified")
+            
+            total = config.n_layers_in_prelude + config.n_layers_in_recurrent_block + config.n_layers_in_coda
+            if total != config.num_hidden_layers:
+                raise ValueError(
+                    f"Layer split mismatch: n_layers_in_prelude ({config.n_layers_in_prelude}) + "
+                    f"n_layers_in_recurrent_block ({config.n_layers_in_recurrent_block}) + "
+                    f"n_layers_in_coda ({config.n_layers_in_coda}) = {total}, "
+                    f"but num_hidden_layers = {config.num_hidden_layers}"
+                )
         
         # Create ModernBERT config
         self.config = ModernBertConfig(
@@ -92,7 +135,18 @@ class ProtModernBertMLM(nn.Module):
             }
             print("rope_parameters nach Fix:", self.config.rope_parameters)
         
-        if self.use_triangular_attention:
+        if self.recycling:
+            print("🔄 Building RECYCLING architecture")
+            # Pass recycling config to ModernBertConfig
+            self.config.n_layers_in_prelude = config.n_layers_in_prelude
+            self.config.n_layers_in_recurrent_block = config.n_layers_in_recurrent_block
+            self.config.n_layers_in_coda = config.n_layers_in_coda
+            self.config.mean_recurrence = config.mean_recurrence
+            self.config.backprop_depth = config.backprop_depth
+            self.config.injection_type = config.injection_type
+            self.config.sampling_scheme = config.sampling_scheme
+            self.bert_model = ModernBertForMaskedLMWithRecycling(self.config)
+        elif self.use_triangular_attention:
             print("🔺 Building MODULAR architecture with triangular attention")
             self.bert_model = ModernBertForMaskedLMWithTriangularAttention(self.config, triangular_attention_layers=config.triangular_layers, triangular_pair_dim=config.triangular_pair_dim, triangular_heads=config.triangular_heads, triangular_dropout=config.triangular_dropout)
             print("=== Weight Check ===")
