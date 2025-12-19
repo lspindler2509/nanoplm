@@ -541,12 +541,6 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
         """Outputs are long tensors so that they can be passed through compiled functions.
         Copied from RecurrentGPT.
         """
-        if torch.rand((1,)).is_meta:  # annoying clause to make meta-tensor-based flop counting work
-            # these values are only approximate, not all schemes exactly target a mean of n and k
-            # they overvalue the compute done when curricula are turned on, but that may be considered
-            # a feature, given that it is a valid form of training acceleration
-            return self.config.mean_recurrence - self.config.backprop_depth, self.config.backprop_depth  # type: ignore
-
         seed_n = 514229 + self.step  # easiest way to make the sampler re-runnable in checkpointing
         seed_k = 317811 + self.step
         lockstep_n = getattr(self.config, 'lockstep_n', False)
