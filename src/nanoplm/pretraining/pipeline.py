@@ -8,6 +8,7 @@ from typing import Optional, Tuple, Union
 from pathlib import Path
 
 from torch.utils.data import Dataset
+from safetensors.torch import load_file
 from transformers import (
     TrainingArguments,
 )
@@ -72,6 +73,7 @@ class ResumeConfig:
     is_resume: bool
     checkpoint_dir: str
     extra_epochs: Optional[int] = None
+    normal_resume: bool = True
 
 
 def _prepare_run_and_steps(
@@ -125,7 +127,7 @@ def _prepare_run_and_steps(
         # Preserve original logging/eval/save intervals when available
         if training_args_path.exists():
             try:
-                original_args = torch.load(training_args_path, weights_only=False)
+                original_args = torch.load(training_args_path, weights_only=False, strict=False)
                 logging_steps = original_args.logging_steps
                 eval_steps = original_args.eval_steps
                 save_steps = original_args.save_steps
@@ -320,6 +322,24 @@ def run_pretraining(
         training_dict["ddp_find_unused_parameters"] = True
 
     args = TrainingArguments(**training_dict)
+    if resume_config and resume_config.is_resume:
+        # print(f"🔄 Resuming training from checkpoint: {resume_config.checkpoint_dir}")
+        # state = torch.load(str(resume_config.checkpoint_dir)+"/pytorch_model.bin", map_location="cpu")
+        # model.load_state_dict(state, strict=False)
+        ckpt_dir = Path(resume_config.checkpoint_dir)
+        ckpt_path = ckpt_dir / "model.safetensors"
+
+        logger.info(f"🔄 Resuming training from checkpoint: {ckpt_path}")
+
+        # If the user requested a normal Trainer resume (preserve optimizer/scheduler etc.),
+        # we do not manually load weights here — the Trainer will handle restoring state when
+        # invoked with resume_from_checkpoint. Otherwise, keep the previous behavior of
+        # loading model weights from safetensors into the model before training.
+        normal = getattr(resume_config, "normal_resume", True)
+        logger.info(f"Resume mode: {'normal' if normal else 'weights-only'}")
+        if not normal:
+            state = load_file(ckpt_path)
+            model.load_state_dict(state, strict=False)
 
     # Find triangular attention layer parameters to log
     param_names_to_log = []
@@ -360,12 +380,14 @@ def run_pretraining(
 
     # Start training and capture W&B run ID immediately after trainer initialization
     try:
-        if resume_config:
-            logger.info(
-                f"Resuming training from checkpoint: {resume_config.checkpoint_dir}"
-            )
-            trainer.train(resume_from_checkpoint=resume_config.checkpoint_dir)
+        if resume_config and getattr(resume_config, "normal_resume", True):
+            logger.info(f"Resuming training (normal) from checkpoint: {resume_config.checkpoint_dir}")
+            trainer.train(resume_from_checkpoint=str(resume_config.checkpoint_dir))
         else:
+            if resume_config:
+                logger.info(
+                    f"Resuming training from checkpoint: {resume_config.checkpoint_dir}"
+                )
             trainer.train()
 
         # Capture and save W&B run ID for future resumes (if W&B is active)

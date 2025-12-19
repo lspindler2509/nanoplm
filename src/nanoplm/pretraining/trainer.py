@@ -51,11 +51,38 @@ class PretrainingTrainer(Trainer):
     HuggingFace Trainer checkpointing.
     """
     
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        """Override to fix mean_square dtype after first optimizer step."""
+        loss = super().training_step(model, inputs, num_items_in_batch)
+        
+        # After first step, ensure mean_square is float32 for stable_adamw
+        # This fixes the issue where mean_square is initialized in bfloat16
+        # but Triton kernel requires float32
+        if not hasattr(self, '_mean_square_fixed'):
+            self._mean_square_fixed = True
+            actual_optimizer = self.optimizer
+            if hasattr(self.optimizer, 'optimizer'):
+                actual_optimizer = self.optimizer.optimizer
+            
+            if any(group.get("triton", False) for group in actual_optimizer.param_groups):
+                fixed = 0
+                for group in actual_optimizer.param_groups:
+                    if group.get("triton", False):
+                        for p in group["params"]:
+                            if p in actual_optimizer.state and "mean_square" in actual_optimizer.state[p]:
+                                ms = actual_optimizer.state[p]["mean_square"]
+                                if ms.dtype != torch.float32:
+                                    actual_optimizer.state[p]["mean_square"] = ms.to(torch.float32)
+                                    fixed += 1
+                if fixed > 0:
+                    logger.info(f"Fixed {fixed} 'mean_square' states to float32")
+        
+        return loss
+    
     def _load_optimizer_and_scheduler(self, checkpoint):
         """If optimizer and scheduler states exist, load them."""
         if checkpoint is None:
             return
-
         if self.is_deepspeed_enabled:
             # deepspeed loads optimizer/lr_scheduler together with the model in deepspeed_init
             if not isinstance(self.lr_scheduler, DeepSpeedSchedulerWrapper):
@@ -89,7 +116,9 @@ class PretrainingTrainer(Trainer):
             if self.is_fsdp_xla_v1_enabled
             else checkpoint_file_exists
         )
-        if checkpoint_file_exists and os.path.isfile(os.path.join(checkpoint, SCHEDULER_NAME)):
+        scheduler_file_exists = os.path.isfile(os.path.join(checkpoint, SCHEDULER_NAME))
+        
+        if checkpoint_file_exists and scheduler_file_exists:
             # Load in optimizer and scheduler states
             if is_torch_xla_available():
                 # On TPU we have to take some extra precautions to properly load the states on the right device.
@@ -113,33 +142,30 @@ class PretrainingTrainer(Trainer):
                     )
                 reissue_pt_warnings(caught_warnings)
                 import torch_xla.core.xla_model as xm
+                
                 xm.send_cpu_data_to_device(optimizer_state, self.args.device)
                 xm.send_cpu_data_to_device(
                     lr_scheduler_state, self.args.device)
 
-                # Try loading optimizer state - handle missing keys (e.g., 'mean_square' for stable_adamw)
-                try:
-                    self.optimizer.load_state_dict(optimizer_state)
-                except (KeyError, RuntimeError) as e:
-                    logger.warning(
-                        f"Error loading optimizer state (likely missing state keys like "
-                        f"'mean_square' for stable_adamw): {type(e).__name__}: {e}. "
-                        "Starting with fresh optimizer state."
-                    )
+                # ✅ NOW SAFE to load
+                self.optimizer.load_state_dict(optimizer_state)
                 self.lr_scheduler.load_state_dict(lr_scheduler_state)
             else:
                 if is_sagemaker_mp_enabled():
                     import smdistributed.modelparallel.torch as smp
                     def opt_load_hook(mod, opt):
+                        optimizer_state = smp.load(os.path.join(
+                            checkpoint, OPTIMIZER_NAME), partial=True)
                         try:
-                            opt.load_state_dict(smp.load(os.path.join(
-                                checkpoint, OPTIMIZER_NAME), partial=True))
+                            opt.load_state_dict(optimizer_state)
                         except (KeyError, RuntimeError) as e:
-                            logger.warning(
-                                f"Error loading optimizer state (likely missing state keys like "
-                                f"'mean_square' for stable_adamw): {type(e).__name__}: {e}. "
-                                "Starting with fresh optimizer state."
-                            )
+                            if "mean_square" in str(e):
+                                logger.warning(
+                                    f"Failed to load stable_adamw optimizer state: {e}. "
+                                    "Starting with fresh optimizer state."
+                                )
+                            else:
+                                raise
 
                     self.model_wrapped.register_post_step_hook(opt_load_hook)
                 else:
@@ -164,108 +190,23 @@ class PretrainingTrainer(Trainer):
                                 "Starting with fresh optimizer state."
                             )
                     else:
-                        # Try loading optimizer state - handle missing keys (e.g., 'mean_square' for stable_adamw)
+                        # Load optimizer state
+                        optimizer_state = torch.load(
+                            os.path.join(checkpoint, OPTIMIZER_NAME), map_location=map_location, weights_only=True
+                        )
+                        
+                        # Try to load, but if it fails (e.g., mean_square KeyError with stable_adamw), skip it
                         try:
-                            saved_state = torch.load(
-                                os.path.join(checkpoint, OPTIMIZER_NAME), map_location=map_location, weights_only=True
-                            )
-                            
-                            # Get the actual optimizer (unwrap AcceleratedOptimizer if needed)
-                            actual_optimizer = self.optimizer
-                            if hasattr(self.optimizer, 'optimizer'):
-                                actual_optimizer = self.optimizer.optimizer
-                            
-                            # First, try to load the state to see what happens
-                            # If it fails, we'll catch the error and fix missing keys
-                            try:
-                                actual_optimizer.load_state_dict(saved_state)
-                                logger.info("Successfully loaded optimizer state without missing keys.")
-                            except (KeyError, RuntimeError) as load_error:
-                                # If loading fails, we need to merge states manually
-                                logger.info(
-                                    f"Optimizer state has missing keys. Merging with current state: {load_error}"
-                                )
-                                
-                                # Get current optimizer state to see what keys are expected
-                                current_state = actual_optimizer.state_dict()
-                                
-                                # Check for missing keys and initialize them
-                                missing_keys = []
-                                saved_state_dict = saved_state.get('state', {})
-                                current_state_dict = current_state.get('state', {})
-                                
-                                # Ensure 'state' key exists in saved_state
-                                if 'state' not in saved_state:
-                                    saved_state['state'] = {}
-                                
-                                # Iterate through all parameters in saved state
-                                for param_id_str in saved_state_dict.keys():
-                                    saved_param_state = saved_state_dict.get(param_id_str, {})
-                                    
-                                    # If this param exists in current state, check for missing keys
-                                    if param_id_str in current_state_dict:
-                                        current_param_state = current_state_dict[param_id_str]
-                                        
-                                        # Check for missing keys in this parameter's state
-                                        for key in current_param_state.keys():
-                                            if key not in saved_param_state:
-                                                missing_keys.append((param_id_str, key))
-                                                
-                                                # Initialize missing key with appropriate dtype
-                                                if key == 'mean_square':
-                                                    # mean_square must be float32 for stable_adamw Triton kernel
-                                                    # Get device from existing state
-                                                    ref_tensor = None
-                                                    if 'exp_avg_sq' in saved_param_state:
-                                                        ref_tensor = saved_param_state['exp_avg_sq']
-                                                    elif 'exp_avg' in saved_param_state:
-                                                        ref_tensor = saved_param_state['exp_avg']
-                                                    
-                                                    if ref_tensor is not None:
-                                                        # mean_square is a scalar (0D tensor) for stable_adamw
-                                                        saved_state['state'][param_id_str][key] = torch.tensor(
-                                                            0.0, dtype=torch.float32, device=ref_tensor.device
-                                                        )
-                                                    else:
-                                                        # Fallback: create scalar tensor on CPU, will be moved by optimizer
-                                                        saved_state['state'][param_id_str][key] = torch.tensor(
-                                                            0.0, dtype=torch.float32
-                                                        )
-                                                    logger.info(
-                                                        f"Initializing missing 'mean_square' state for param {param_id_str} "
-                                                        f"in float32 (required for stable_adamw Triton kernel)"
-                                                    )
-                                                else:
-                                                    # For other missing keys, use the current state's value
-                                                    saved_state['state'][param_id_str][key] = current_param_state[key].clone()
-                                                    logger.info(
-                                                        f"Initializing missing '{key}' state for param {param_id_str}"
-                                                    )
-                                
-                                if missing_keys:
-                                    logger.info(
-                                        f"Found {len(missing_keys)} missing state keys. Initialized them and loading merged state."
-                                    )
-                                
-                                # Now try loading the merged state
-                                actual_optimizer.load_state_dict(saved_state)
-                                
-                                # After loading, ensure mean_square is still float32 (in case optimizer changed it)
-                                for param_id_str, param_state in actual_optimizer.state.items():
-                                    if 'mean_square' in param_state:
-                                        if param_state['mean_square'].dtype != torch.float32:
-                                            logger.warning(
-                                                f"Converting 'mean_square' to float32 for param {param_id_str} "
-                                                f"(was {param_state['mean_square'].dtype})"
-                                            )
-                                            param_state['mean_square'] = param_state['mean_square'].to(dtype=torch.float32)
-                            
+                            self.optimizer.load_state_dict(optimizer_state)
+                            logger.info("Successfully loaded optimizer state")
                         except (KeyError, RuntimeError) as e:
-                            logger.warning(
-                                f"Error loading optimizer state (likely missing state keys like "
-                                f"'mean_square' for stable_adamw): {type(e).__name__}: {e}. "
-                                "Starting with fresh optimizer state."
-                            )
+                            if "mean_square" in str(e):
+                                logger.warning(
+                                    f"Failed to load stable_adamw optimizer state: {e}. "
+                                    "Starting with fresh optimizer state."
+                                )
+                            else:
+                                raise
                 with warnings.catch_warnings(record=True) as caught_warnings:
                     self.lr_scheduler.load_state_dict(
                         torch.load(os.path.join(

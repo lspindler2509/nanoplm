@@ -586,6 +586,9 @@ def get_yaml(output: Optional[str], force: bool):
         "  is_resume: False\n"
         "  checkpoint_dir: \"output/pretraining_checkpoints/run-1/checkpoint-1\"\n"
         "  extra_epochs: 0\n"
+        "  # normal_resume: if True, perform a normal Trainer resume (do not manually load weights)\n"
+        "  # Set to True when you want to resume training exactly (optimizer/scheduler state restored)\n"
+        "  normal_resume: True\n"
     )
 
     # If forcing, remove existing file first
@@ -733,6 +736,13 @@ def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
 
     checkpoint_dir = kwargs.get("checkpoint_dir")
 
+    # Optionally accept normal_resume in older/flat YAMLs as either bool or string
+    if "normal_resume" in config:
+        kwargs["normal_resume"] = config.get("normal_resume")
+
+    # Default behavior: normal resume unless explicitly set to False
+    if "normal_resume" not in kwargs:
+        kwargs["normal_resume"] = True
     if "extra_epochs" in config:
         kwargs["extra_epochs"] = config.get("extra_epochs")
     is_resume = kwargs.get("is_resume", False)
