@@ -17,8 +17,12 @@ class Data2VecUpdateCallback(TrainerCallback):
         **kwargs
     ):
         """Update EMA teacher after each training step."""
-        if model is not None and hasattr(model, 'set_num_updates'):
-            model.set_num_updates(state.global_step)
+        if model is not None:
+            if hasattr(model, 'set_num_updates'):
+                model.set_num_updates(state.global_step)
+            elif hasattr(model, 'bert_model') and hasattr(model.bert_model, 'set_num_updates'):
+                # Fallback: try bert_model.set_num_updates
+                model.bert_model.set_num_updates(state.global_step)
 
 
 class ParameterLoggingCallback(TrainerCallback):
@@ -86,19 +90,30 @@ class Data2VecLossLoggingCallback(TrainerCallback):
     ):
         """Log separate losses when logging happens."""
         if wandb.run is not None and model is not None and logs is not None:
-            # Check if model has loss tracking attributes (Data2Vec enabled)
-            if hasattr(model, '_last_mlm_loss') and model._last_mlm_loss is not None:
-                loss_logs = {
-                    "loss/mlm_loss": model._last_mlm_loss,
-                }
-                
-                if hasattr(model, '_last_d2v_loss') and model._last_d2v_loss is not None:
-                    loss_logs["loss/data2vec_loss"] = model._last_d2v_loss
-                    loss_logs["loss/data2vec_loss_weighted"] = (
-                        model._last_d2v_loss * getattr(model.config, 'data2vec_loss_weight', 0.5)
-                    )
-                
-                wandb.log(loss_logs)
+            # Structure: ProtModernBertMLM -> bert_model (ModernBertForMaskedLMWithRecycling)
+            # Losses are stored in bert_model._last_mlm_loss and bert_model._last_d2v_loss
+            bert_model = None
+            if hasattr(model, 'bert_model'):
+                bert_model = model.bert_model
+            elif hasattr(model, 'model'):  # Fallback
+                bert_model = model.model
+            
+            if bert_model is not None:
+                # Check if model has loss tracking attributes (Data2Vec enabled)
+                if hasattr(bert_model, '_last_mlm_loss') and bert_model._last_mlm_loss is not None:
+                    loss_logs = {
+                        "loss/mlm_loss": bert_model._last_mlm_loss,
+                    }
+                    
+                    if hasattr(bert_model, '_last_d2v_loss') and bert_model._last_d2v_loss is not None:
+                        loss_logs["loss/data2vec_loss"] = bert_model._last_d2v_loss
+                        # Get data2vec_loss_weight from config
+                        d2v_weight = 0.5
+                        if hasattr(bert_model, 'config'):
+                            d2v_weight = getattr(bert_model.config, 'data2vec_loss_weight', 0.5)
+                        loss_logs["loss/data2vec_loss_weighted"] = bert_model._last_d2v_loss * d2v_weight
+                    
+                    wandb.log(loss_logs)
         
         return control
 

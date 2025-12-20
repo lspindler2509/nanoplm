@@ -542,6 +542,7 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
                         self.fp32_params[name] = teacher_param.data.clone().float()
         
         self.ema = SimpleEMA(teacher_model, self.ema_decay)
+        logger.info(f"✅ Data2Vec EMA teacher created (decay={self.ema_decay}, top_k_layers={self.average_top_k_layers}, loss_weight={getattr(self.config, 'data2vec_loss_weight', 0.5)})")
     
     def set_num_updates(self, num_updates):
         """Update EMA decay rate and step EMA teacher for Data2Vec."""
