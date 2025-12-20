@@ -70,6 +70,10 @@ class ModernBertForMaskedLMWithRecycling(ModernBertPreTrainedModel):
 
         self.sparse_prediction = self.config.sparse_prediction
         self.sparse_pred_ignore_index = self.config.sparse_pred_ignore_index
+        
+        # Store losses for logging (Data2Vec)
+        self._last_mlm_loss = None
+        self._last_d2v_loss = None
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -304,8 +308,13 @@ class ModernBertForMaskedLMWithRecycling(ModernBertPreTrainedModel):
 
         loss = None
         if labels is not None:
-            loss = self.loss_function(
+            mlm_loss = self.loss_function(
                 logits, labels, vocab_size=self.config.vocab_size, **kwargs)
+            loss = mlm_loss
+            
+            # Store MLM loss for logging
+            self._last_mlm_loss = mlm_loss.detach().item() if torch.is_tensor(mlm_loss) else mlm_loss
+            self._last_d2v_loss = None
             
             # Data2Vec Loss (if enabled)
             if self.model.use_data2vec and self.model.ema is not None:
@@ -324,6 +333,8 @@ class ModernBertForMaskedLMWithRecycling(ModernBertPreTrainedModel):
                     last_hidden_state=last_hidden_state,
                 )
                 if d2v_loss is not None:
+                    # Store Data2Vec loss for logging
+                    self._last_d2v_loss = d2v_loss.detach().item() if torch.is_tensor(d2v_loss) else d2v_loss
                     # Combine losses (weighted)
                     d2v_weight = getattr(self.config, 'data2vec_loss_weight', 0.5)
                     loss = loss + d2v_weight * d2v_loss

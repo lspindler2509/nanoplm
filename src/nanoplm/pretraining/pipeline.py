@@ -360,11 +360,12 @@ def run_pretraining(
     # Create callbacks
     callbacks = []
     
-    # Data2Vec EMA update callback (if Data2Vec is enabled)
+    # Data2Vec callbacks (if Data2Vec is enabled)
     if hasattr(model, 'model') and hasattr(model.model, 'use_data2vec') and model.model.use_data2vec:
-        from nanoplm.pretraining.callbacks import Data2VecUpdateCallback
+        from nanoplm.pretraining.callbacks import Data2VecUpdateCallback, Data2VecLossLoggingCallback
         callbacks.append(Data2VecUpdateCallback())
-        logger.info("Data2Vec enabled: EMA teacher will be updated during training")
+        callbacks.append(Data2VecLossLoggingCallback())
+        logger.info("Data2Vec enabled: EMA teacher will be updated during training, separate losses will be logged")
     
     # Parameter logging callback
     if param_names_to_log:

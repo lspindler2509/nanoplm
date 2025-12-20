@@ -71,3 +71,34 @@ class ParameterLoggingCallback(TrainerCallback):
         
         return control
 
+
+class Data2VecLossLoggingCallback(TrainerCallback):
+    """Callback to log separate MLM and Data2Vec losses to WandB."""
+    
+    def on_log(
+        self,
+        args,
+        state: TrainerState,
+        control: TrainerControl,
+        model=None,
+        logs: Optional[dict] = None,
+        **kwargs
+    ):
+        """Log separate losses when logging happens."""
+        if wandb.run is not None and model is not None and logs is not None:
+            # Check if model has loss tracking attributes (Data2Vec enabled)
+            if hasattr(model, '_last_mlm_loss') and model._last_mlm_loss is not None:
+                loss_logs = {
+                    "loss/mlm_loss": model._last_mlm_loss,
+                }
+                
+                if hasattr(model, '_last_d2v_loss') and model._last_d2v_loss is not None:
+                    loss_logs["loss/data2vec_loss"] = model._last_d2v_loss
+                    loss_logs["loss/data2vec_loss_weighted"] = (
+                        model._last_d2v_loss * getattr(model.config, 'data2vec_loss_weight', 0.5)
+                    )
+                
+                wandb.log(loss_logs)
+        
+        return control
+

@@ -155,6 +155,14 @@ class ProtModernBertMLM(nn.Module):
             self.config.backprop_depth = config.backprop_depth
             self.config.injection_type = config.injection_type
             self.config.sampling_scheme = config.sampling_scheme
+            self.config.state_init = config.state_init
+            # Pass Data2Vec config to ModernBertConfig
+            self.config.use_data2vec = config.use_data2vec
+            self.config.average_top_k_layers = config.average_top_k_layers
+            self.config.ema_decay = config.ema_decay
+            self.config.ema_end_decay = config.ema_end_decay
+            self.config.ema_anneal_end_step = config.ema_anneal_end_step
+            self.config.data2vec_loss_weight = config.data2vec_loss_weight
             self.bert_model = ModernBertForMaskedLMWithRecycling(self.config)
         elif self.use_triangular_attention:
             print("🔺 Building MODULAR architecture with triangular attention")
