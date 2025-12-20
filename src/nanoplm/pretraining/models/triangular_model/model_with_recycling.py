@@ -505,11 +505,17 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
         if not self.use_data2vec:
             return
         
+        # Get device of student model
+        student_device = next(self.parameters()).device
+        
         # Create a copy of the model as teacher
         teacher_model = ModernBertModelWithRecycling(self.config)
         teacher_model.load_state_dict(self.state_dict())
         teacher_model.requires_grad_(False)
         teacher_model.eval()
+        
+        # Move teacher to same device as student
+        teacher_model = teacher_model.to(student_device)
         
         # Simple EMA wrapper
         class SimpleEMA:
@@ -542,7 +548,7 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
                         self.fp32_params[name] = teacher_param.data.clone().float()
         
         self.ema = SimpleEMA(teacher_model, self.ema_decay)
-        logger.info(f"✅ Data2Vec EMA teacher created (decay={self.ema_decay}, top_k_layers={self.average_top_k_layers}, loss_weight={getattr(self.config, 'data2vec_loss_weight', 0.5)})")
+        logger.info(f"✅ Data2Vec EMA teacher created on {student_device} (decay={self.ema_decay}, top_k_layers={self.average_top_k_layers}, loss_weight={getattr(self.config, 'data2vec_loss_weight', 0.5)})")
     
     def set_num_updates(self, num_updates):
         """Update EMA decay rate and step EMA teacher for Data2Vec."""
