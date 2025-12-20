@@ -211,27 +211,31 @@ class ModernBertForMaskedLMWithRecycling(ModernBertPreTrainedModel):
                 target = target.view(-1, target.size(-1))
                 target_masked = target[mask_tokens]
         
-        # Student prediction (after regression head)
+        # Student prediction (following fairseq exactly: apply regression head AFTER masking)
+        # In fairseq: x = x[masked_indices], then x = self.regression_head(x)
         if self.sparse_prediction:
-            student_pred = self.model.regression_head(last_hidden_state)
+            # For sparse prediction, last_hidden_state is already masked
+            x = self.model.regression_head(last_hidden_state)
+            y = target_masked
         else:
+            # For dense prediction, mask first, then apply regression head
             student_hidden = last_hidden_state.view(-1, last_hidden_state.size(-1))
-            student_pred = self.model.regression_head(student_hidden[mask_tokens])
+            x = self.model.regression_head(student_hidden[mask_tokens])
+            y = target_masked
         
-        # MSE Loss (following fairseq Data2Vec implementation)
-        # Use reduction='none' to sum over features dimension, then scale
-        loss_per_token = F.mse_loss(student_pred.float(), target_masked.float(), reduction='none').sum(dim=-1)
+        # MSE Loss (following fairseq Data2Vec implementation exactly, line 476)
+        # Use reduction='none' to sum over features dimension
+        sz = x.size(-1)  # hidden_size (feature dimension)
+        loss = F.mse_loss(x.float(), y.float(), reduction="none").sum(dim=-1)
         
-        # Scale loss by 1/sqrt(hidden_size) to match fairseq default behavior
-        # This reduces gradient norm and stabilizes training
-        hidden_size = student_pred.size(-1)
+        # Scale loss exactly as in fairseq (line 484-486)
         loss_scale = getattr(self.model.config, 'data2vec_loss_scale', -1.0)
         if loss_scale <= 0:
-            # Default: scale by 1/sqrt(hidden_size) as in fairseq
-            d2v_loss = loss_per_token.sum() / math.sqrt(hidden_size)
+            # Default: scale by 1/sqrt(hidden_size) as in fairseq (line 484)
+            d2v_loss = loss.sum() / math.sqrt(sz)
         else:
-            # Use explicit loss_scale if provided
-            d2v_loss = loss_per_token.sum() * loss_scale
+            # Use explicit loss_scale if provided (line 486)
+            d2v_loss = loss.sum() * loss_scale
         
         return d2v_loss
 
@@ -581,8 +585,8 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
         if not self.use_data2vec:
             return
         
-        # Initialize EMA teacher on first update
-        if self.ema is None and num_updates > 0:
+        # Initialize EMA teacher on first update (at step 0)
+        if self.ema is None and num_updates >= 0:
             self.make_ema_teacher()
         
         if self.training and self.ema is not None:
@@ -596,8 +600,8 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
             
             self.ema.set_decay(decay)
             
-            # Update EMA
-            if self.ema.get_decay() < 1:
+            # Update EMA (skip at step 0, start updating from step 1)
+            if num_updates > 0 and self.ema.get_decay() < 1:
                 self.ema.step(self)
 
     def forward(
