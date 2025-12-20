@@ -10,6 +10,7 @@ import torch.nn.functional as F
 import math
 import re
 from contextlib import nullcontext
+import copy
 
 
 try:
@@ -120,6 +121,89 @@ class ModernBertForMaskedLMWithRecycling(ModernBertPreTrainedModel):
 
     def set_output_embeddings(self, new_embeddings: nn.Linear):
         self.decoder = new_embeddings
+    
+    def set_num_updates(self, num_updates):
+        """Update EMA decay rate and step EMA teacher for Data2Vec."""
+        if hasattr(self.model, 'set_num_updates'):
+            self.model.set_num_updates(num_updates)
+    
+    def _compute_data2vec_loss(
+        self,
+        input_ids,
+        attention_mask,
+        sliding_window_mask,
+        position_ids,
+        inputs_embeds,
+        indices,
+        cu_seqlens,
+        max_seqlen,
+        batch_size,
+        seq_len,
+        labels,
+        last_hidden_state,
+    ):
+        """Compute Data2Vec loss using EMA teacher model."""
+        if self.model.ema is None or self.model.regression_head is None:
+            return None
+        
+        # Get mask tokens (same as MLM loss)
+        if self.sparse_prediction:
+            mask_tokens = labels.view(-1) != self.sparse_pred_ignore_index
+        else:
+            # For dense prediction, we need to find masked positions
+            # Assume labels contain -100 for non-masked tokens
+            mask_tokens = labels.view(-1) != -100
+        
+        if not mask_tokens.any():
+            return None
+        
+        with torch.no_grad():
+            self.model.ema.model.eval()
+            
+            # Teacher forward pass (with unmasked input)
+            teacher_outputs = self.model.ema.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                sliding_window_mask=sliding_window_mask,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                indices=indices,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                output_hidden_states=True,
+            )
+            
+            # Get target from top-K layers average
+            if hasattr(teacher_outputs, 'hidden_states') and teacher_outputs.hidden_states:
+                top_k = teacher_outputs.hidden_states[-self.model.average_top_k_layers:]
+                # Average over layers
+                target = sum(top_k) / len(top_k)
+            else:
+                # Fallback: use last hidden state
+                target = teacher_outputs[0]
+            
+            # Handle sparse prediction case
+            if self.sparse_prediction:
+                target = target.view(-1, target.size(-1))
+                target_masked = target[mask_tokens]
+            else:
+                # For dense prediction, reshape and mask
+                target = target.view(-1, target.size(-1))
+                target_masked = target[mask_tokens]
+        
+        # Student prediction (after regression head)
+        if self.sparse_prediction:
+            student_pred = self.model.regression_head(last_hidden_state)
+        else:
+            student_hidden = last_hidden_state.view(-1, last_hidden_state.size(-1))
+            student_pred = self.model.regression_head(student_hidden[mask_tokens])
+        
+        # MSE Loss
+        d2v_loss = F.mse_loss(student_pred, target_masked, reduction='mean')
+        
+        return d2v_loss
 
     @torch.compile(dynamic=True)
     def compiled_head(self, output: torch.Tensor) -> torch.Tensor:
@@ -222,6 +306,27 @@ class ModernBertForMaskedLMWithRecycling(ModernBertPreTrainedModel):
         if labels is not None:
             loss = self.loss_function(
                 logits, labels, vocab_size=self.config.vocab_size, **kwargs)
+            
+            # Data2Vec Loss (if enabled)
+            if self.model.use_data2vec and self.model.ema is not None:
+                d2v_loss = self._compute_data2vec_loss(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    sliding_window_mask=sliding_window_mask,
+                    position_ids=position_ids,
+                    inputs_embeds=inputs_embeds,
+                    indices=indices,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    labels=labels,
+                    last_hidden_state=last_hidden_state,
+                )
+                if d2v_loss is not None:
+                    # Combine losses (weighted)
+                    d2v_weight = getattr(self.config, 'data2vec_loss_weight', 0.5)
+                    loss = loss + d2v_weight * d2v_loss
 
         if self.config._attn_implementation == "flash_attention_2":
             # Logits padding
@@ -311,6 +416,22 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
         # Embedding scale for state initialization (if not in config, default to 1)
         self.emb_scale = getattr(config, 'embedding_scale', 1.0)
         
+        # Data2Vec: EMA Teacher and Regression Head
+        self.ema = None  # Will be initialized later
+        self.average_top_k_layers = getattr(config, 'average_top_k_layers', 4)
+        self.ema_decay = getattr(config, 'ema_decay', 0.999)
+        self.ema_end_decay = getattr(config, 'ema_end_decay', 0.9999)
+        self.ema_anneal_end_step = getattr(config, 'ema_anneal_end_step', 40000)
+        self.use_data2vec = getattr(config, 'use_data2vec', False)
+        
+        # Regression Head for Data2Vec
+        if self.use_data2vec:
+            regression_head = nn.Linear(config.hidden_size, config.hidden_size)
+            regression_head._is_regression_head = True
+            self.regression_head = regression_head
+        else:
+            self.regression_head = None
+        
         self.post_init()
 
     def _init_weights(self, module: nn.Module):
@@ -354,6 +475,9 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
             # Adapter for linear injection: initialize like "in_proj" (same as input projections)
             # This matches RecurrentGPT's init_method=config.init.fn("in_proj", ...)
             init_weight(module, stds["in"])
+        elif isinstance(module, nn.Linear) and hasattr(module, '_is_regression_head') and module._is_regression_head:
+            # Regression head for Data2Vec: initialize like output projections
+            init_weight(module, stds["out"])
         elif isinstance(module, nn.LayerNorm):
             module.weight.data.fill_(1.0)
             if module.bias is not None:
@@ -364,6 +488,73 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
 
     def set_input_embeddings(self, value):
         self.embeddings.tok_embeddings = value
+    
+    def make_ema_teacher(self):
+        """Create EMA teacher model for Data2Vec."""
+        if not self.use_data2vec:
+            return
+        
+        # Create a copy of the model as teacher
+        teacher_model = ModernBertModelWithRecycling(self.config)
+        teacher_model.load_state_dict(self.state_dict())
+        teacher_model.requires_grad_(False)
+        teacher_model.eval()
+        
+        # Simple EMA wrapper
+        class SimpleEMA:
+            def __init__(self, model, decay):
+                self.model = model
+                self.decay = decay
+                self.fp32_params = {}
+                # Store fp32 copies of parameters
+                for name, param in model.named_parameters():
+                    self.fp32_params[name] = param.data.clone().float()
+            
+            def set_decay(self, decay):
+                self.decay = decay
+            
+            def get_decay(self):
+                return self.decay
+            
+            def step(self, student_model):
+                """Update teacher parameters using EMA."""
+                with torch.no_grad():
+                    for (name, student_param), (_, teacher_param) in zip(
+                        student_model.named_parameters(),
+                        self.model.named_parameters()
+                    ):
+                        # EMA update: teacher = decay * teacher + (1 - decay) * student
+                        teacher_param.data.mul_(self.decay).add_(
+                            student_param.data, alpha=1 - self.decay
+                        )
+                        # Update fp32 copy
+                        self.fp32_params[name] = teacher_param.data.clone().float()
+        
+        self.ema = SimpleEMA(teacher_model, self.ema_decay)
+    
+    def set_num_updates(self, num_updates):
+        """Update EMA decay rate and step EMA teacher for Data2Vec."""
+        if not self.use_data2vec:
+            return
+        
+        # Initialize EMA teacher on first update
+        if self.ema is None and num_updates > 0:
+            self.make_ema_teacher()
+        
+        if self.training and self.ema is not None:
+            # Anneal decay rate
+            if num_updates < self.ema_anneal_end_step:
+                # Linear annealing
+                progress = num_updates / self.ema_anneal_end_step
+                decay = self.ema_decay + (self.ema_end_decay - self.ema_decay) * progress
+            else:
+                decay = self.ema_end_decay
+            
+            self.ema.set_decay(decay)
+            
+            # Update EMA
+            if self.ema.get_decay() < 1:
+                self.ema.step(self)
 
     def forward(
         self,

@@ -357,8 +357,16 @@ def run_pretraining(
         ]):
             param_names_to_log.append(name)
     
-    # Create callback for parameter logging
+    # Create callbacks
     callbacks = []
+    
+    # Data2Vec EMA update callback (if Data2Vec is enabled)
+    if hasattr(model, 'model') and hasattr(model.model, 'use_data2vec') and model.model.use_data2vec:
+        from nanoplm.pretraining.callbacks import Data2VecUpdateCallback
+        callbacks.append(Data2VecUpdateCallback())
+        logger.info("Data2Vec enabled: EMA teacher will be updated during training")
+    
+    # Parameter logging callback
     if param_names_to_log:
         logger.info(f"Will log {len(param_names_to_log)} parameters to WandB: {param_names_to_log[:3]}...")
         param_callback = ParameterLoggingCallback(

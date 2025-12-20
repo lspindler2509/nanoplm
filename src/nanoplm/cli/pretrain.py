@@ -678,7 +678,14 @@ def _load_model_config(config: Dict[str, Any]) -> ProtModernBertMLMConfig:
         'backprop_depth',
         'injection_type',
         'sampling_scheme',
-        'state_init'
+        'state_init',
+        # Data2Vec parameters
+        'use_data2vec',
+        'average_top_k_layers',
+        'ema_decay',
+        'ema_end_decay',
+        'ema_anneal_end_step',
+        'data2vec_loss_weight',
     }
     
     # Required keys are all keys except optional ones

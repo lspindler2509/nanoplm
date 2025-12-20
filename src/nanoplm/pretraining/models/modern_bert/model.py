@@ -38,6 +38,13 @@ class ProtModernBertMLMConfig:
     injection_type: Optional[str] = "add"  # Options: "add", "gate", "linear", "ffn", "none"
     sampling_scheme: Optional[str] = "uniform-0-4"  # Sampling scheme for num_steps_no_grad (uniform 0-4 recurrent steps)
     state_init: Optional[str] = "like-init"  # Options: "normal", "embed", "like-init", "zero", "unit"
+    # Data2Vec parameters
+    use_data2vec: Optional[bool] = False  # Enable Data2Vec self-supervised learning
+    average_top_k_layers: Optional[int] = 4  # Number of top layers to average for teacher target
+    ema_decay: Optional[float] = 0.999  # Initial EMA decay rate
+    ema_end_decay: Optional[float] = 0.9999  # Final EMA decay rate
+    ema_anneal_end_step: Optional[int] = 40000  # Steps to finish EMA decay annealing
+    data2vec_loss_weight: Optional[float] = 0.5  # Weight for Data2Vec loss (combined with MLM loss)
 
 class ProtModernBertMLM(nn.Module):
     """

@@ -5,6 +5,22 @@ from transformers import TrainerCallback, TrainerState, TrainerControl
 from typing import Optional
 
 
+class Data2VecUpdateCallback(TrainerCallback):
+    """Callback to update EMA teacher for Data2Vec."""
+    
+    def on_step_end(
+        self,
+        args,
+        state: TrainerState,
+        control: TrainerControl,
+        model=None,
+        **kwargs
+    ):
+        """Update EMA teacher after each training step."""
+        if model is not None and hasattr(model, 'set_num_updates'):
+            model.set_num_updates(state.global_step)
+
+
 class ParameterLoggingCallback(TrainerCallback):
     """Callback to log specific model parameters to WandB."""
     
