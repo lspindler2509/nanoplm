@@ -188,6 +188,20 @@ class ModernBertForMaskedLMWithRecycling(ModernBertPreTrainedModel):
                 # Fallback: use last hidden state
                 target = teacher_outputs[0]
             
+            # Apply target normalization (following fairseq Data2Vec implementation)
+            layer_norm_targets = getattr(self.model.config, 'data2vec_layer_norm_targets', False)
+            instance_norm_targets = getattr(self.model.config, 'data2vec_instance_norm_targets', False)
+            
+            if layer_norm_targets:
+                # Layer norm over feature dimension
+                target = F.layer_norm(target.float(), target.shape[-1:])
+            elif instance_norm_targets:
+                # Instance norm: transpose to (batch, features, seq_len), norm, transpose back
+                if target.dim() == 3:  # (batch, seq_len, features)
+                    target = F.instance_norm(target.transpose(1, 2).float()).transpose(1, 2)
+                else:  # Already flattened or 2D
+                    target = F.instance_norm(target.float())
+            
             # Handle sparse prediction case
             if self.sparse_prediction:
                 target = target.view(-1, target.size(-1))
@@ -204,8 +218,20 @@ class ModernBertForMaskedLMWithRecycling(ModernBertPreTrainedModel):
             student_hidden = last_hidden_state.view(-1, last_hidden_state.size(-1))
             student_pred = self.model.regression_head(student_hidden[mask_tokens])
         
-        # MSE Loss
-        d2v_loss = F.mse_loss(student_pred, target_masked, reduction='mean')
+        # MSE Loss (following fairseq Data2Vec implementation)
+        # Use reduction='none' to sum over features dimension, then scale
+        loss_per_token = F.mse_loss(student_pred.float(), target_masked.float(), reduction='none').sum(dim=-1)
+        
+        # Scale loss by 1/sqrt(hidden_size) to match fairseq default behavior
+        # This reduces gradient norm and stabilizes training
+        hidden_size = student_pred.size(-1)
+        loss_scale = getattr(self.model.config, 'data2vec_loss_scale', None)
+        if loss_scale is None or loss_scale <= 0:
+            # Default: scale by 1/sqrt(hidden_size) as in fairseq
+            d2v_loss = loss_per_token.sum() / math.sqrt(hidden_size)
+        else:
+            # Use explicit loss_scale if provided
+            d2v_loss = loss_per_token.sum() * loss_scale
         
         return d2v_loss
 

@@ -686,6 +686,9 @@ def _load_model_config(config: Dict[str, Any]) -> ProtModernBertMLMConfig:
         'ema_end_decay',
         'ema_anneal_end_step',
         'data2vec_loss_weight',
+        'data2vec_loss_scale',
+        'data2vec_layer_norm_targets',
+        'data2vec_instance_norm_targets',
     }
     
     # Required keys are all keys except optional ones
