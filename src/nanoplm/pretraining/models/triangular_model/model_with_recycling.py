@@ -164,13 +164,31 @@ class ModernBertForMaskedLMWithRecycling(ModernBertPreTrainedModel):
         with torch.no_grad():
             self.model.ema.model.eval()
             
-            # Teacher forward pass (with unmasked input)
+            # Reconstruct unmasked tokens for teacher (following fairseq: teacher gets target_tokens)
+            # In fairseq, target_tokens are the original (unmasked) tokens
+            # We reconstruct them from labels: labels contain original token IDs for masked positions, -100 for others
+            # For unmasked positions, we use input_ids (which may be masked, random, or original)
+            # But for teacher, we want the original tokens, so we use labels where available, else input_ids
+            if input_ids is not None:
+                # Create target_tokens: use labels for masked positions (where labels != -100), else use input_ids
+                target_tokens = input_ids.clone()
+                if labels is not None:
+                    # Where labels are valid (not -100), use them (these are the original tokens)
+                    valid_labels = labels != -100
+                    target_tokens[valid_labels] = labels[valid_labels]
+            else:
+                # If no input_ids, use inputs_embeds (but we can't create target_tokens from embeddings)
+                # In this case, we'll use the masked input_ids for teacher (not ideal, but necessary)
+                target_tokens = None
+            
+            # Teacher forward pass (with unmasked input, following fairseq line 426-429)
+            # In fairseq: encoder_out = self.ema.model(target_tokens, return_all_hiddens=True)
             teacher_outputs = self.model.ema.model(
-                input_ids=input_ids,
+                input_ids=target_tokens if target_tokens is not None else input_ids,
                 attention_mask=attention_mask,
                 sliding_window_mask=sliding_window_mask,
                 position_ids=position_ids,
-                inputs_embeds=inputs_embeds,
+                inputs_embeds=inputs_embeds if target_tokens is None else None,
                 indices=indices,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
@@ -179,24 +197,27 @@ class ModernBertForMaskedLMWithRecycling(ModernBertPreTrainedModel):
                 output_hidden_states=True,
             )
             
-            # Get target from top-K layers average
+            # Get target from top-K layers average (following fairseq line 430-432)
+            # In fairseq: y = encoder_out["fc_results"], then y = y[-self.average_top_k_layers:]
+            # We use hidden_states instead (which are similar to fc_results, just after layer norm)
             if hasattr(teacher_outputs, 'hidden_states') and teacher_outputs.hidden_states:
                 top_k = teacher_outputs.hidden_states[-self.model.average_top_k_layers:]
-                # Average over layers
+                # Average over layers (fairseq line 456)
                 target = sum(top_k) / len(top_k)
             else:
                 # Fallback: use last hidden state
                 target = teacher_outputs[0]
             
-            # Apply target normalization (following fairseq Data2Vec implementation)
+            # Apply target normalization (following fairseq Data2Vec implementation, lines 461-465)
+            # Note: fairseq handles transpose for instance_norm, but we assume target is already B x T x C
             layer_norm_targets = getattr(self.model.config, 'data2vec_layer_norm_targets', False)
             instance_norm_targets = getattr(self.model.config, 'data2vec_instance_norm_targets', False)
             
             if layer_norm_targets:
-                # Layer norm over feature dimension
+                # Layer norm over feature dimension (fairseq line 462)
                 target = F.layer_norm(target.float(), target.shape[-1:])
             elif instance_norm_targets:
-                # Instance norm: transpose to (batch, features, seq_len), norm, transpose back
+                # Instance norm: transpose to (batch, features, seq_len), norm, transpose back (fairseq line 464-465)
                 if target.dim() == 3:  # (batch, seq_len, features)
                     target = F.instance_norm(target.transpose(1, 2).float()).transpose(1, 2)
                 else:  # Already flattened or 2D
@@ -601,6 +622,8 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
             self.ema.set_decay(decay)
             
             # Update EMA (skip at step 0, start updating from step 1)
+            # In fairseq line 371: self.ema.step(self.sentence_encoder)
+            # In our case, we step the whole model (since EMA wraps the whole model)
             if num_updates > 0 and self.ema.get_decay() < 1:
                 self.ema.step(self)
 
