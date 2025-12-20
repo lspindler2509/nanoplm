@@ -677,7 +677,8 @@ def _load_model_config(config: Dict[str, Any]) -> ProtModernBertMLMConfig:
         'mean_recurrence',
         'backprop_depth',
         'injection_type',
-        'sampling_scheme'
+        'sampling_scheme',
+        'state_init'
     }
     
     # Required keys are all keys except optional ones

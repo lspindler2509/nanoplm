@@ -37,6 +37,7 @@ class ProtModernBertMLMConfig:
     backprop_depth: Optional[int] = 1  # Fixed number of iterations with gradients (not randomized)
     injection_type: Optional[str] = "add"  # Options: "add", "gate", "linear", "ffn", "none"
     sampling_scheme: Optional[str] = "uniform-0-4"  # Sampling scheme for num_steps_no_grad (uniform 0-4 recurrent steps)
+    state_init: Optional[str] = "like-init"  # Options: "normal", "embed", "like-init", "zero", "unit"
 
 class ProtModernBertMLM(nn.Module):
     """
@@ -79,6 +80,8 @@ class ProtModernBertMLM(nn.Module):
                 raise ValueError("When recycling=True, injection_type must be specified")
             if config.sampling_scheme is None:
                 raise ValueError("When recycling=True, sampling_scheme must be specified")
+            if config.state_init is None:
+                raise ValueError("When recycling=True, state_init must be specified")
             
             total = config.n_layers_in_prelude + config.n_layers_in_recurrent_block + config.n_layers_in_coda
             if total != config.num_hidden_layers:

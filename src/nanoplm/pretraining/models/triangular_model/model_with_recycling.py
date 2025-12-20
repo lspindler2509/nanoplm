@@ -270,6 +270,8 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
         # Adapter for input injection (if needed)
         if config.injection_type == "linear":
             adapter = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=config.attention_bias)
+            # Mark as adapter for special initialization (like RecurrentGPT's "in_proj" init)
+            adapter._is_adapter = True
         elif config.injection_type == "ffn":
             # Simple 2-layer MLP
             adapter = nn.Sequential(
@@ -277,6 +279,9 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
                 nn.GELU(),
                 nn.Linear(config.hidden_size, config.hidden_size, bias=config.attention_bias),
             )
+            # Mark first layer as adapter for special initialization
+            adapter[0]._is_adapter = True
+            # Second layer uses standard "out" initialization (handled by normal Linear init)
         else:
             adapter = nn.Identity()
         
@@ -345,6 +350,10 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
             init_weight(module.dense, stds["out"])
         elif isinstance(module, ModernBertForMaskedLM) or isinstance(module, ModernBertForMaskedLMWithRecycling):
             init_weight(module.decoder, stds["out"])
+        elif isinstance(module, nn.Linear) and hasattr(module, '_is_adapter') and module._is_adapter:
+            # Adapter for linear injection: initialize like "in_proj" (same as input projections)
+            # This matches RecurrentGPT's init_method=config.init.fn("in_proj", ...)
+            init_weight(module, stds["in"])
         elif isinstance(module, nn.LayerNorm):
             module.weight.data.fill_(1.0)
             if module.bias is not None:
@@ -675,7 +684,7 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
         if self.config.injection_type == "none":
             return input_embeds
         
-        state_init = getattr(self.config, 'state_init', 'normal')
+        state_init = getattr(self.config, 'state_init', 'like-init')
         
         if state_init == "normal":
             x = torch.randn_like(input_embeds)
