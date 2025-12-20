@@ -45,7 +45,7 @@ class ProtModernBertMLMConfig:
     ema_end_decay: Optional[float] = 0.9999  # Final EMA decay rate
     ema_anneal_end_step: Optional[int] = 40000  # Steps to finish EMA decay annealing
     data2vec_loss_weight: Optional[float] = 0.5  # Weight for Data2Vec loss (combined with MLM loss)
-    data2vec_loss_scale: Optional[float] = None  # Loss scale (None = 1/sqrt(hidden_size) as in fairseq, >0 = explicit scale)
+    data2vec_loss_scale: Optional[float] = -1.0  # Loss scale (-1.0 = auto = 1/sqrt(hidden_size) as in fairseq, >0 = explicit scale)
     data2vec_layer_norm_targets: Optional[bool] = False  # Apply layer norm to teacher targets (improves stability)
     data2vec_instance_norm_targets: Optional[bool] = False  # Apply instance norm to teacher targets (improves stability)
 

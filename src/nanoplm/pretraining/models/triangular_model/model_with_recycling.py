@@ -225,8 +225,8 @@ class ModernBertForMaskedLMWithRecycling(ModernBertPreTrainedModel):
         # Scale loss by 1/sqrt(hidden_size) to match fairseq default behavior
         # This reduces gradient norm and stabilizes training
         hidden_size = student_pred.size(-1)
-        loss_scale = getattr(self.model.config, 'data2vec_loss_scale', None)
-        if loss_scale is None or loss_scale <= 0:
+        loss_scale = getattr(self.model.config, 'data2vec_loss_scale', -1.0)
+        if loss_scale <= 0:
             # Default: scale by 1/sqrt(hidden_size) as in fairseq
             d2v_loss = loss_per_token.sum() / math.sqrt(hidden_size)
         else:
