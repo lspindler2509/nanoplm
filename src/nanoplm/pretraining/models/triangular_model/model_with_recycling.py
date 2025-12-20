@@ -473,15 +473,21 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
         input_embeds_for_recycling = hidden_states
         
         # Recycling: iterate_forward
-        x, num_steps_no_grad, num_steps_with_grad, xk = self.iterate_forward(
+        x, num_steps_no_grad, num_steps_with_grad, xk, recycling_attentions = self.iterate_forward(
             input_embeds_for_recycling,
             position_embeddings,
             attention_mask,
             sliding_window_mask,
             cu_seqlens,
             max_seqlen,
+            position_ids=position_ids,
+            output_attentions=output_attentions,
         )
         hidden_states = x
+        
+        # Add recycling attentions to all_self_attentions
+        if output_attentions and recycling_attentions is not None:
+            all_self_attentions = all_self_attentions + recycling_attentions
         
         # Coda: process through coda layers
         for encoder_layer in self.transformer.coda:
@@ -696,9 +702,12 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
         return x
     
     @torch._dynamo.disable(recursive=False)
-    def iterate_forward(self, input_embeds, position_embeddings, attention_mask, sliding_window_mask, cu_seqlens, max_seqlen, num_steps_pair: Optional[torch.Tensor] = None):
+    def iterate_forward(self, input_embeds, position_embeddings, attention_mask, sliding_window_mask, cu_seqlens, max_seqlen, position_ids: Optional[torch.LongTensor] = None, output_attentions: Optional[bool] = None, num_steps_pair: Optional[torch.Tensor] = None):
         """Recycling iteration. Copied from RecurrentGPT."""
         x = self.initialize_state(input_embeds)
+        
+        # Initialize all_self_attentions for recycling block
+        all_self_attentions = () if output_attentions else None
         
         if num_steps_pair is None:
             num_steps_no_grad, num_steps_with_grad = self.randomized_iteration_sampler()
@@ -719,15 +728,20 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
         with torch.no_grad():
             for step in range(num_steps_no_grad_int):
                 xk = x
-                x = self.core_block_forward(xk, input_embeds, position_embeddings, attention_mask, sliding_window_mask, cu_seqlens, max_seqlen, step + offset)
+                x, attentions = self.core_block_forward(xk, input_embeds, position_embeddings, attention_mask, sliding_window_mask, cu_seqlens, max_seqlen, position_ids, output_attentions, step + offset, all_self_attentions)
+                if output_attentions:
+                    all_self_attentions = attentions
         
         for step in range(num_steps_with_grad_int):
             xk = x
-            x = self.core_block_forward(xk, input_embeds, position_embeddings, attention_mask, sliding_window_mask, cu_seqlens, max_seqlen, num_steps_no_grad_int + step + offset)
+            x, attentions = self.core_block_forward(xk, input_embeds, position_embeddings, attention_mask, sliding_window_mask, cu_seqlens, max_seqlen, position_ids, output_attentions, num_steps_no_grad_int + step + offset, all_self_attentions)
+            if output_attentions:
+                all_self_attentions = attentions
         
-        return x, num_steps_no_grad, num_steps_with_grad, xk.detach()
+        # Apply final layer norm (like in original RecurrentGPT - applied both here and after coda)
+        return self.final_norm(x), num_steps_no_grad, num_steps_with_grad, xk.detach(), all_self_attentions
     
-    def core_block_forward(self, x, input_embeds, position_embeddings, attention_mask, sliding_window_mask, cu_seqlens, max_seqlen, step: Union[torch.Tensor, int]):
+    def core_block_forward(self, x, input_embeds, position_embeddings, attention_mask, sliding_window_mask, cu_seqlens, max_seqlen, position_ids: Optional[torch.LongTensor], output_attentions: Optional[bool], step: Union[torch.Tensor, int], all_self_attentions: Optional[tuple] = None):
         """One iteration through core_block. Adapted from RecurrentGPT."""
         # Input injection
         if self.config.injection_type == "add":
@@ -741,22 +755,23 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
         
         # Process through core_block layers
         for encoder_layer in self.transformer.core_block:
-            # Get position embeddings for this layer's attention type
-            layer_pe = position_embeddings.get(encoder_layer.attention_type, position_embeddings.get("full_attention"))
-            
             layer_outputs = encoder_layer(
                 x,
                 attention_mask=attention_mask,
                 sliding_window_mask=sliding_window_mask,
-                position_ids=None,  # Not needed when position_embeddings is provided
+                position_ids=position_ids,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
-                position_embeddings=layer_pe,
-                output_attentions=False,
+                position_embeddings=position_embeddings[encoder_layer.attention_type],
+                output_attentions=output_attentions or False,
             )
             x = layer_outputs[0]
+            if output_attentions and len(layer_outputs) > 1:
+                if all_self_attentions is None:
+                    all_self_attentions = ()
+                all_self_attentions = all_self_attentions + (layer_outputs[1],)
         
-        return x
+        return x, all_self_attentions
 
     def _update_attention_mask(self, attention_mask: torch.Tensor, output_attentions: bool) -> torch.Tensor:
         if output_attentions:
