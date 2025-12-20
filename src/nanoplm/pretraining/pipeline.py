@@ -361,7 +361,13 @@ def run_pretraining(
     callbacks = []
     
     # Data2Vec callbacks (if Data2Vec is enabled)
-    if hasattr(model, 'model') and hasattr(model.model, 'use_data2vec') and model.model.use_data2vec:
+    # Structure: ProtModernBertMLM -> bert_model (ModernBertForMaskedLMWithRecycling) -> model (ModernBertModelWithRecycling)
+    use_data2vec = False
+    if hasattr(model, 'bert_model') and hasattr(model.bert_model, 'model'):
+        if hasattr(model.bert_model.model, 'use_data2vec'):
+            use_data2vec = model.bert_model.model.use_data2vec
+    
+    if use_data2vec:
         from nanoplm.pretraining.callbacks import Data2VecUpdateCallback, Data2VecLossLoggingCallback
         callbacks.append(Data2VecUpdateCallback())
         callbacks.append(Data2VecLossLoggingCallback())
