@@ -689,6 +689,7 @@ def _load_model_config(config: Dict[str, Any]) -> ProtModernBertMLMConfig:
         'data2vec_loss_scale',
         'data2vec_layer_norm_targets',
         'data2vec_instance_norm_targets',
+        'recycling_mode',
     }
     
     # Required keys are all keys except optional ones

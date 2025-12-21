@@ -38,6 +38,7 @@ class ProtModernBertMLMConfig:
     injection_type: Optional[str] = "add"  # Options: "add", "gate", "linear", "ffn", "none"
     sampling_scheme: Optional[str] = "uniform-0-4"  # Sampling scheme for num_steps_no_grad (uniform 0-4 recurrent steps)
     state_init: Optional[str] = "like-init"  # Options: "normal", "embed", "like-init", "zero", "unit"
+    recycling_mode: Optional[str] = "recurrentgpt"  # Options: "recurrentgpt" (default) or "boltz2" (additive recycling like AlphaFold/Boltz2)
     # Data2Vec parameters
     use_data2vec: Optional[bool] = False  # Enable Data2Vec self-supervised learning
     average_top_k_layers: Optional[int] = 4  # Number of top layers to average for teacher target

@@ -258,6 +258,13 @@ class ModernBertForMaskedLMWithRecycling(ModernBertPreTrainedModel):
             # Use explicit loss_scale if provided (line 486)
             d2v_loss = loss.sum() * loss_scale
         
+        # Normalize by number of masked tokens to get per-token loss
+        # This prevents loss from growing with batch size or sequence length
+        # Fairseq uses sample_size for this, but we normalize directly here
+        num_masked = mask_tokens.sum().float()
+        if num_masked > 0:
+            d2v_loss = d2v_loss / num_masked
+        
         return d2v_loss
 
     @torch.compile(dynamic=True)
@@ -478,6 +485,25 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
         # Embedding scale for state initialization (if not in config, default to 1)
         self.emb_scale = getattr(config, 'embedding_scale', 1.0)
         
+        # Recycling mode: "recurrentgpt" (default) or "boltz2" (additive recycling)
+        self.recycling_mode = getattr(config, 'recycling_mode', 'recurrentgpt')
+        
+        # Boltz2-style additive recycling components (only if recycling_mode == "boltz2")
+        if self.recycling_mode == "boltz2":
+            # s_init: Projection from input embeddings to initial state
+            s_init = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+            s_init._is_s_init = True  # Mark for special initialization
+            self.s_init = s_init
+            # s_norm: LayerNorm for state normalization
+            self.s_norm = nn.LayerNorm(config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
+            # s_recycle: Recycling projection (initialized to 0, like gating_init_)
+            s_recycle = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+            s_recycle._is_s_recycle = True  # Mark for special initialization
+            self.s_recycle = s_recycle
+            # Initialize s_recycle to 0 (like Boltz2's gating_init_)
+            with torch.no_grad():
+                self.s_recycle.weight.fill_(0.0)
+        
         # Data2Vec: EMA Teacher and Regression Head
         self.ema = None  # Will be initialized later
         self.average_top_k_layers = getattr(config, 'average_top_k_layers', 4)
@@ -538,8 +564,16 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
             # This matches RecurrentGPT's init_method=config.init.fn("in_proj", ...)
             init_weight(module, stds["in"])
         elif isinstance(module, nn.Linear) and hasattr(module, '_is_regression_head') and module._is_regression_head:
-            # Regression head for Data2Vec: initialize like output projections
-            init_weight(module, stds["out"])
+            # Regression head for Data2Vec: initialize with larger std for better initial predictions
+            # Use "in" std instead of "out" std to allow larger initial values
+            init_weight(module, stds["in"])
+        elif isinstance(module, nn.Linear) and hasattr(module, '_is_s_init') and module._is_s_init:
+            # s_init for Boltz2-style recycling: initialize like input projections
+            init_weight(module, stds["in"])
+        elif isinstance(module, nn.Linear) and hasattr(module, '_is_s_recycle') and module._is_s_recycle:
+            # s_recycle for Boltz2-style recycling: already initialized to 0 (gating_init_)
+            # No need to re-initialize, it's already set to 0 in __init__
+            pass
         elif isinstance(module, nn.LayerNorm):
             module.weight.data.fill_(1.0)
             if module.bias is not None:
@@ -974,9 +1008,10 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
     
     @torch._dynamo.disable(recursive=False)
     def iterate_forward(self, input_embeds, position_embeddings, attention_mask, sliding_window_mask, cu_seqlens, max_seqlen, position_ids: Optional[torch.LongTensor] = None, output_attentions: Optional[bool] = None, num_steps_pair: Optional[torch.Tensor] = None):
-        """Recycling iteration. Copied from RecurrentGPT."""
-        x = self.initialize_state(input_embeds)
-        
+        """Recycling iteration. Supports two modes:
+        - "recurrentgpt": State is initialized and passed through core_block (default)
+        - "boltz2": Additive recycling like Boltz2/AlphaFold (s = s_init + s_recycle(s_norm(s)))
+        """
         # Initialize all_self_attentions for recycling block
         all_self_attentions = () if output_attentions else None
         
@@ -996,18 +1031,51 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
         else:
             offset = 0
         
-        with torch.no_grad():
-            for step in range(num_steps_no_grad_int):
+        # Boltz2-style additive recycling
+        if self.recycling_mode == "boltz2":
+            # Compute s_init from input embeddings (like Boltz2)
+            s_init = self.s_init(input_embeds)
+            # State starts at 0 (like Boltz2)
+            x = torch.zeros_like(s_init)
+            xk = x  # Store for return value
+            
+            # No-grad steps
+            with torch.no_grad():
+                for step in range(num_steps_no_grad_int):
+                    xk = x
+                    # Additive recycling: s = s_init + s_recycle(s_norm(s))
+                    x = s_init + self.s_recycle(self.s_norm(x).to(self.dtype))
+                    # Process through core_block
+                    x, attentions = self.core_block_forward(x, input_embeds, position_embeddings, attention_mask, sliding_window_mask, cu_seqlens, max_seqlen, position_ids, output_attentions, step + offset, all_self_attentions)
+                    if output_attentions:
+                        all_self_attentions = attentions
+            
+            # With-grad steps
+            for step in range(num_steps_with_grad_int):
                 xk = x
-                x, attentions = self.core_block_forward(xk, input_embeds, position_embeddings, attention_mask, sliding_window_mask, cu_seqlens, max_seqlen, position_ids, output_attentions, step + offset, all_self_attentions)
+                # Additive recycling: s = s_init + s_recycle(s_norm(s))
+                x = s_init + self.s_recycle(self.s_norm(x))
+                # Process through core_block
+                x, attentions = self.core_block_forward(x, input_embeds, position_embeddings, attention_mask, sliding_window_mask, cu_seqlens, max_seqlen, position_ids, output_attentions, num_steps_no_grad_int + step + offset, all_self_attentions)
                 if output_attentions:
                     all_self_attentions = attentions
         
-        for step in range(num_steps_with_grad_int):
-            xk = x
-            x, attentions = self.core_block_forward(xk, input_embeds, position_embeddings, attention_mask, sliding_window_mask, cu_seqlens, max_seqlen, position_ids, output_attentions, num_steps_no_grad_int + step + offset, all_self_attentions)
-            if output_attentions:
-                all_self_attentions = attentions
+        # RecurrentGPT-style recycling (default)
+        else:
+            x = self.initialize_state(input_embeds)
+            
+            with torch.no_grad():
+                for step in range(num_steps_no_grad_int):
+                    xk = x
+                    x, attentions = self.core_block_forward(xk, input_embeds, position_embeddings, attention_mask, sliding_window_mask, cu_seqlens, max_seqlen, position_ids, output_attentions, step + offset, all_self_attentions)
+                    if output_attentions:
+                        all_self_attentions = attentions
+            
+            for step in range(num_steps_with_grad_int):
+                xk = x
+                x, attentions = self.core_block_forward(xk, input_embeds, position_embeddings, attention_mask, sliding_window_mask, cu_seqlens, max_seqlen, position_ids, output_attentions, num_steps_no_grad_int + step + offset, all_self_attentions)
+                if output_attentions:
+                    all_self_attentions = attentions
         
         # Apply final layer norm (like in original RecurrentGPT - applied both here and after coda)
         return self.final_norm(x), num_steps_no_grad, num_steps_with_grad, xk.detach(), all_self_attentions
