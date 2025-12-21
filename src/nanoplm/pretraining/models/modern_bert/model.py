@@ -160,6 +160,7 @@ class ProtModernBertMLM(nn.Module):
             self.config.injection_type = config.injection_type
             self.config.sampling_scheme = config.sampling_scheme
             self.config.state_init = config.state_init
+            self.config.recycling_mode = config.recycling_mode
             # Pass Data2Vec config to ModernBertConfig
             self.config.use_data2vec = config.use_data2vec
             self.config.average_top_k_layers = config.average_top_k_layers
@@ -182,7 +183,8 @@ class ProtModernBertMLM(nn.Module):
                         print(f"⚠️  PROBLEMATIC: {name}")
         else:
             print("🔧 Building STANDARD ModernBERT architecture")
-            self.bert_model = ModernBertForMaskedLM(self.config)
+            self.bert_model = ModernBertForMaskedLM(self.config)  
+        print(self.config)
         
         # Print model parameter count
         self._print_parameter_count()
