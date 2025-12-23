@@ -1082,15 +1082,18 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
     
     def core_block_forward(self, x, input_embeds, position_embeddings, attention_mask, sliding_window_mask, cu_seqlens, max_seqlen, position_ids: Optional[torch.LongTensor], output_attentions: Optional[bool], step: Union[torch.Tensor, int], all_self_attentions: Optional[tuple] = None):
         """One iteration through core_block. Adapted from RecurrentGPT."""
-        # Input injection
-        if self.config.injection_type == "add":
-            x = x + input_embeds
-        elif self.config.injection_type == "gate":
-            x = x * input_embeds
-        elif self.config.injection_type in ["linear", "ffn"]:
-            x = self.transformer.adapter(torch.cat([x, input_embeds], dim=-1))
-        else:
-            raise ValueError(f"Invalid injection_type: {self.config.injection_type}")
+        # Input injection (only for RecurrentGPT-style recycling, not for Boltz2)
+        # In Boltz2 mode, the state already contains input information via s_init,
+        # so no additional injection is needed (matching Boltz2's pairformer behavior)
+        if self.recycling_mode != "boltz2":
+            if self.config.injection_type == "add":
+                x = x + input_embeds
+            elif self.config.injection_type == "gate":
+                x = x * input_embeds
+            elif self.config.injection_type in ["linear", "ffn"]:
+                x = self.transformer.adapter(torch.cat([x, input_embeds], dim=-1))
+            else:
+                raise ValueError(f"Invalid injection_type: {self.config.injection_type}")
         
         # Process through core_block layers
         for encoder_layer in self.transformer.core_block:
