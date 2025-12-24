@@ -1014,6 +1014,7 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
         """
         # Initialize all_self_attentions for recycling block
         all_self_attentions = () if output_attentions else None
+        num_steps_pair = [3, 1]  # TEMPORARY OVERRIDE FOR TESTING
         
         if num_steps_pair is None:
             num_steps_no_grad, num_steps_with_grad = self.randomized_iteration_sampler()
@@ -1077,8 +1078,13 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
                 if output_attentions:
                     all_self_attentions = attentions
         
-        # Apply final layer norm (like in original RecurrentGPT - applied both here and after coda)
-        return self.final_norm(x), num_steps_no_grad, num_steps_with_grad, xk.detach(), all_self_attentions
+        # Apply final layer norm (only for RecurrentGPT-style, not for Boltz2)
+        # In Boltz2, the state is used directly without final normalization (matching Boltz2's behavior)
+        if self.recycling_mode == "boltz2":
+            return x, num_steps_no_grad, num_steps_with_grad, xk.detach(), all_self_attentions
+        else:
+            # RecurrentGPT-style: apply final layer norm (applied both here and after coda)
+            return self.final_norm(x), num_steps_no_grad, num_steps_with_grad, xk.detach(), all_self_attentions
     
     def core_block_forward(self, x, input_embeds, position_embeddings, attention_mask, sliding_window_mask, cu_seqlens, max_seqlen, position_ids: Optional[torch.LongTensor], output_attentions: Optional[bool], step: Union[torch.Tensor, int], all_self_attentions: Optional[tuple] = None):
         """One iteration through core_block. Adapted from RecurrentGPT."""
