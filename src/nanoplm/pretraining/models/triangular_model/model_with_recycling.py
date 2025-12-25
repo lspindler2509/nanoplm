@@ -462,15 +462,15 @@ class ModernBertForMaskedLMWithRecycling(ModernBertPreTrainedModel):
             attentions=outputs.attentions,
         )
         
-        # Store separate losses as attributes for logging (only if Data2Vec is enabled and labels provided)
-        # Note: We can't add them to MaskedLMOutput as it's a dataclass, so we store them as attributes
+        # Store separate losses in self for logging (only if Data2Vec is enabled and labels provided)
+        # Note: We can't add them to MaskedLMOutput as it's a dataclass, so we store them in the model instance
         if self.model.use_data2vec and labels is not None:
             # Store MLM loss for logging (detached to avoid gradient issues)
             if mlm_loss is not None:
-                output.mlm_loss = mlm_loss.detach() if torch.is_tensor(mlm_loss) else mlm_loss
+                self._last_mlm_loss = mlm_loss.detach().item() if torch.is_tensor(mlm_loss) else mlm_loss
             # Store Data2Vec loss for logging (detached to avoid gradient issues)
             if d2v_loss is not None:
-                output.data2vec_loss = d2v_loss.detach() if torch.is_tensor(d2v_loss) else d2v_loss
+                self._last_d2v_loss = d2v_loss.detach().item() if torch.is_tensor(d2v_loss) else d2v_loss
         
         return output
 

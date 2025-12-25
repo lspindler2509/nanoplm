@@ -51,29 +51,6 @@ class PretrainingTrainer(Trainer):
     HuggingFace Trainer checkpointing.
     """
     
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        """Override to extract separate losses from model output for logging."""
-        loss, outputs = super().compute_loss(model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch)
-        
-        # Extract separate losses from model output if available (for Data2Vec logging)
-        if isinstance(outputs, dict) or hasattr(outputs, 'mlm_loss'):
-            # ModelOutput objects can have additional fields
-            if hasattr(outputs, 'mlm_loss') and outputs.mlm_loss is not None:
-                # Store in a temporary attribute that will be logged
-                # Note: We can't modify logs here, but we can store in model for callback
-                if hasattr(model, 'bert_model'):
-                    model.bert_model._last_mlm_loss = outputs.mlm_loss.item() if torch.is_tensor(outputs.mlm_loss) else outputs.mlm_loss
-                elif hasattr(model, 'model'):
-                    model.model._last_mlm_loss = outputs.mlm_loss.item() if torch.is_tensor(outputs.mlm_loss) else outputs.mlm_loss
-                    
-            if hasattr(outputs, 'data2vec_loss') and outputs.data2vec_loss is not None:
-                if hasattr(model, 'bert_model'):
-                    model.bert_model._last_d2v_loss = outputs.data2vec_loss.item() if torch.is_tensor(outputs.data2vec_loss) else outputs.data2vec_loss
-                elif hasattr(model, 'model'):
-                    model.model._last_d2v_loss = outputs.data2vec_loss.item() if torch.is_tensor(outputs.data2vec_loss) else outputs.data2vec_loss
-        
-        return (loss, outputs) if return_outputs else loss
-    
     def training_step(self, model, inputs, num_items_in_batch=None):
         """Override to fix mean_square dtype after first optimizer step."""
         loss = super().training_step(model, inputs, num_items_in_batch)
