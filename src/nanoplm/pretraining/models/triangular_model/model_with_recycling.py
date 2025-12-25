@@ -6,11 +6,21 @@ from transformers.modeling_outputs import BaseModelOutput
 from transformers.utils import logging
 from nanoplm.pretraining.models.modern_bert.activations import ACT2FN
 from transformers.modeling_outputs import MaskedLMOutput
+from nanoplm.utils import EMAModule, EMAModuleConfig
 import torch.nn.functional as F
 import math
 import re
 from contextlib import nullcontext
 import copy
+
+
+def get_annealed_rate(start, end, curr_step, total_steps):
+    """Compute annealed rate between start and end. Copied from Fairseq."""
+    if curr_step >= total_steps:
+        return end
+    r = end - start
+    pct_remaining = 1 - curr_step / total_steps
+    return end - r * pct_remaining
 
 
 try:
@@ -70,10 +80,6 @@ class ModernBertForMaskedLMWithRecycling(ModernBertPreTrainedModel):
 
         self.sparse_prediction = self.config.sparse_prediction
         self.sparse_pred_ignore_index = self.config.sparse_pred_ignore_index
-        
-        # Store losses for logging (Data2Vec)
-        self._last_mlm_loss = None
-        self._last_d2v_loss = None
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -199,17 +205,44 @@ class ModernBertForMaskedLMWithRecycling(ModernBertPreTrainedModel):
             
             # Get target from top-K layers average (following fairseq line 430-432)
             # In fairseq: y = encoder_out["fc_results"], then y = y[-self.average_top_k_layers:]
-            # We use hidden_states instead (which are similar to fc_results, just after layer norm)
+            # fc_results are hidden states AFTER layer norm in each layer
+            # We use hidden_states which should be after layer norm in each layer
             if hasattr(teacher_outputs, 'hidden_states') and teacher_outputs.hidden_states:
                 top_k = teacher_outputs.hidden_states[-self.model.average_top_k_layers:]
+                
+                # Apply layer normalization BEFORE averaging (fairseq lines 435-454)
+                # This is critical: normalize each layer individually, then average
+                layer_norm_target_layer = getattr(self.model.config, 'data2vec_layer_norm_target_layer', False)
+                instance_norm_target_layer = getattr(self.model.config, 'data2vec_instance_norm_target_layer', False)
+                batch_norm_target_layer = getattr(self.model.config, 'data2vec_batch_norm_target_layer', False)
+                
+                # Note: Fairseq uses T x B x C format, we use B x T x C
+                # Fairseq transposes for instance/batch norm, we don't need to
+                if batch_norm_target_layer:
+                    # Batch norm on each layer (fairseq lines 439-445)
+                    top_k = [
+                        F.batch_norm(
+                            tl.float(), running_mean=None, running_var=None, training=True
+                        )
+                        for tl in top_k
+                    ]
+                
+                if instance_norm_target_layer:
+                    # Instance norm on each layer (fairseq line 447-448)
+                    # Fairseq transposes TBC->BCT, but we're already B x T x C
+                    top_k = [F.instance_norm(tl.float()) for tl in top_k]
+                
+                if layer_norm_target_layer:
+                    # Layer norm on each layer (fairseq line 453-454)
+                    top_k = [F.layer_norm(tl.float(), tl.shape[-1:]) for tl in top_k]
+                
                 # Average over layers (fairseq line 456)
                 target = sum(top_k) / len(top_k)
             else:
                 # Fallback: use last hidden state
                 target = teacher_outputs[0]
             
-            # Apply target normalization (following fairseq Data2Vec implementation, lines 461-465)
-            # Note: fairseq handles transpose for instance_norm, but we assume target is already B x T x C
+            # Apply target normalization AFTER averaging (fairseq lines 461-465)
             layer_norm_targets = getattr(self.model.config, 'data2vec_layer_norm_targets', False)
             instance_norm_targets = getattr(self.model.config, 'data2vec_instance_norm_targets', False)
             
@@ -244,10 +277,18 @@ class ModernBertForMaskedLMWithRecycling(ModernBertPreTrainedModel):
             x = self.model.regression_head(student_hidden[mask_tokens])
             y = target_masked
         
-        # MSE Loss (following fairseq Data2Vec implementation exactly, line 476)
+        # Loss computation (following fairseq Data2Vec implementation exactly, lines 474-480)
         # Use reduction='none' to sum over features dimension
         sz = x.size(-1)  # hidden_size (feature dimension)
-        loss = F.mse_loss(x.float(), y.float(), reduction="none").sum(dim=-1)
+        loss_beta = getattr(self.model.config, 'data2vec_loss_beta', 0.0)
+        if loss_beta == 0:
+            # MSE Loss (fairseq line 476)
+            loss = F.mse_loss(x.float(), y.float(), reduction="none").sum(dim=-1)
+        else:
+            # Smooth L1 Loss (fairseq lines 478-480)
+            loss = F.smooth_l1_loss(
+                x.float(), y.float(), reduction="none", beta=loss_beta
+            ).sum(dim=-1)
         
         # Scale loss exactly as in fairseq (line 484-486)
         loss_scale = getattr(self.model.config, 'data2vec_loss_scale', -1.0)
@@ -258,12 +299,12 @@ class ModernBertForMaskedLMWithRecycling(ModernBertPreTrainedModel):
             # Use explicit loss_scale if provided (line 486)
             d2v_loss = loss.sum() * loss_scale
         
-        # Normalize by number of masked tokens to get per-token loss
-        # This prevents loss from growing with batch size or sequence length
-        # Fairseq uses sample_size for this, but we normalize directly here
-        num_masked = mask_tokens.sum().float()
-        if num_masked > 0:
-            d2v_loss = d2v_loss / num_masked
+        # Normalize by sample_size (num_masked * hidden_size) to match Fairseq
+        # Fairseq divides gradients by sample_size in trainer (trainer.py:946)
+        # We normalize the loss directly here since HuggingFace Trainer doesn't do this
+        sample_size = loss.numel()  # = num_masked * hidden_size (same as Fairseq line 488)
+        if sample_size > 0:
+            d2v_loss = d2v_loss / sample_size
         
         return d2v_loss
 
@@ -369,10 +410,7 @@ class ModernBertForMaskedLMWithRecycling(ModernBertPreTrainedModel):
             mlm_loss = self.loss_function(
                 logits, labels, vocab_size=self.config.vocab_size, **kwargs)
             loss = mlm_loss
-            
-            # Store MLM loss for logging
-            self._last_mlm_loss = mlm_loss.detach().item() if torch.is_tensor(mlm_loss) else mlm_loss
-            self._last_d2v_loss = None
+            d2v_loss = None
             
             # Data2Vec Loss (if enabled)
             if self.model.use_data2vec and self.model.ema is not None:
@@ -391,8 +429,6 @@ class ModernBertForMaskedLMWithRecycling(ModernBertPreTrainedModel):
                     last_hidden_state=last_hidden_state,
                 )
                 if d2v_loss is not None:
-                    # Store Data2Vec loss for logging
-                    self._last_d2v_loss = d2v_loss.detach().item() if torch.is_tensor(d2v_loss) else d2v_loss
                     # Combine losses (weighted)
                     d2v_weight = getattr(self.config, 'data2vec_loss_weight', 0.5)
                     loss = loss + d2v_weight * d2v_loss
@@ -418,12 +454,24 @@ class ModernBertForMaskedLMWithRecycling(ModernBertPreTrainedModel):
             output = (logits,)
             return ((loss,) + output) if loss is not None else output
 
-        return MaskedLMOutput(
-            loss=loss,
-            logits=logits,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
+        # Prepare output with additional loss fields for logging (if Data2Vec is enabled)
+        output_kwargs = {
+            "loss": loss,
+            "logits": logits,
+            "hidden_states": outputs.hidden_states,
+            "attentions": outputs.attentions,
+        }
+        
+        # Add separate loss fields for logging (only if Data2Vec is enabled and labels provided)
+        if self.model.use_data2vec and labels is not None:
+            # Store MLM loss for logging (detached to avoid gradient issues)
+            if mlm_loss is not None:
+                output_kwargs["mlm_loss"] = mlm_loss.detach() if torch.is_tensor(mlm_loss) else mlm_loss
+            # Store Data2Vec loss for logging (detached to avoid gradient issues)
+            if d2v_loss is not None:
+                output_kwargs["data2vec_loss"] = d2v_loss.detach() if torch.is_tensor(d2v_loss) else d2v_loss
+        
+        return MaskedLMOutput(**output_kwargs)
 
 
 class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
@@ -497,9 +545,7 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
             # s_norm: LayerNorm for state normalization
             self.s_norm = nn.LayerNorm(config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
             # s_recycle: Recycling projection (initialized to 0, like gating_init_)
-            s_recycle = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
-            s_recycle._is_s_recycle = True  # Mark for special initialization
-            self.s_recycle = s_recycle
+            self.s_recycle = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
             # Initialize s_recycle to 0 (like Boltz2's gating_init_)
             with torch.no_grad():
                 self.s_recycle.weight.fill_(0.0)
@@ -514,9 +560,24 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
         
         # Regression Head for Data2Vec
         if self.use_data2vec:
-            regression_head = nn.Linear(config.hidden_size, config.hidden_size)
-            regression_head._is_regression_head = True
-            self.regression_head = regression_head
+            head_layers = getattr(config, 'data2vec_head_layers', 1)
+            assert head_layers >= 1
+            
+            embed_dim = config.hidden_size
+            curr_dim = embed_dim
+            projs = []
+            for i in range(head_layers - 1):
+                next_dim = embed_dim * 2 if i == 0 else curr_dim
+                linear = nn.Linear(curr_dim, next_dim)
+                linear._is_regression_head = True  # Mark for initialization
+                projs.append(linear)
+                projs.append(nn.GELU())
+                curr_dim = next_dim
+            
+            final_linear = nn.Linear(curr_dim, embed_dim)
+            final_linear._is_regression_head = True  # Mark for initialization
+            projs.append(final_linear)
+            self.regression_head = nn.Sequential(*projs)
         else:
             self.regression_head = None
         
@@ -570,10 +631,6 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
         elif isinstance(module, nn.Linear) and hasattr(module, '_is_s_init') and module._is_s_init:
             # s_init for Boltz2-style recycling: initialize like input projections
             init_weight(module, stds["in"])
-        elif isinstance(module, nn.Linear) and hasattr(module, '_is_s_recycle') and module._is_s_recycle:
-            # s_recycle for Boltz2-style recycling: already initialized to 0 (gating_init_)
-            # No need to re-initialize, it's already set to 0 in __init__
-            pass
         elif isinstance(module, nn.LayerNorm):
             module.weight.data.fill_(1.0)
             if module.bias is not None:
@@ -586,80 +643,65 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
         self.embeddings.tok_embeddings = value
     
     def make_ema_teacher(self):
-        """Create EMA teacher model for Data2Vec."""
-        if not self.use_data2vec:
-            return
-        
-        # Get device of student model
-        student_device = next(self.parameters()).device
-        
-        # Create a copy of the model as teacher
-        teacher_model = ModernBertModelWithRecycling(self.config)
-        teacher_model.load_state_dict(self.state_dict())
-        teacher_model.requires_grad_(False)
-        teacher_model.eval()
-        
-        # Move teacher to same device as student
-        teacher_model = teacher_model.to(student_device)
-        
-        # Simple EMA wrapper
-        class SimpleEMA:
-            def __init__(self, model, decay):
-                self.model = model
-                self.decay = decay
-                self.fp32_params = {}
-                # Store fp32 copies of parameters
-                for name, param in model.named_parameters():
-                    self.fp32_params[name] = param.data.clone().float()
-            
-            def set_decay(self, decay):
-                self.decay = decay
-            
-            def get_decay(self):
-                return self.decay
-            
-            def step(self, student_model):
-                """Update teacher parameters using EMA."""
-                with torch.no_grad():
-                    for (name, student_param), (_, teacher_param) in zip(
-                        student_model.named_parameters(),
-                        self.model.named_parameters()
-                    ):
-                        # EMA update: teacher = decay * teacher + (1 - decay) * student
-                        teacher_param.data.mul_(self.decay).add_(
-                            student_param.data, alpha=1 - self.decay
-                        )
-                        # Update fp32 copy
-                        self.fp32_params[name] = teacher_param.data.clone().float()
-        
-        self.ema = SimpleEMA(teacher_model, self.ema_decay)
-        logger.info(f"✅ Data2Vec EMA teacher created on {student_device} (decay={self.ema_decay}, top_k_layers={self.average_top_k_layers}, loss_weight={getattr(self.config, 'data2vec_loss_weight', 0.5)})")
+        """Create EMA teacher model for Data2Vec. Copied from Fairseq."""
+        ema_config = EMAModuleConfig(
+            ema_decay=self.ema_decay,
+            ema_fp32=True,
+        )
+        skip_keys = set()
+        # Skip embeddings if ema_transformer_layers_only is True (like Fairseq)
+        # This means embeddings are directly copied instead of EMA-updated
+        if getattr(self.config, 'ema_transformer_layers_only', False):
+            # Skip token embeddings (like Fairseq's embed_tokens)
+            for k, _ in self.embeddings.tok_embeddings.named_parameters():
+                skip_keys.add(f"embeddings.tok_embeddings.{k}")
+            # Skip embedding layer norm (like Fairseq's layernorm_embedding)
+            for k, _ in self.embeddings.norm.named_parameters():
+                skip_keys.add(f"embeddings.norm.{k}")
+            # Note: We don't have embed_positions (we use RoPE instead)
+
+        self.ema = EMAModule(
+            self,
+            ema_config,
+            copy_model=True,  # Let EMAModule handle the copy
+            skip_keys=skip_keys,
+        )
     
     def set_num_updates(self, num_updates):
-        """Update EMA decay rate and step EMA teacher for Data2Vec."""
-        if not self.use_data2vec:
-            return
-        
-        # Initialize EMA teacher on first update (at step 0)
-        if self.ema is None and num_updates >= 0:
+        """Update EMA decay rate and step EMA teacher for Data2Vec. Copied from Fairseq."""
+        if self.ema is None and self.regression_head is not None:
+            logger.info(f"making ema teacher")
             self.make_ema_teacher()
-        
-        if self.training and self.ema is not None:
-            # Anneal decay rate
-            if num_updates < self.ema_anneal_end_step:
-                # Linear annealing
-                progress = num_updates / self.ema_anneal_end_step
-                decay = self.ema_decay + (self.ema_end_decay - self.ema_decay) * progress
-            else:
-                decay = self.ema_end_decay
-            
-            self.ema.set_decay(decay)
-            
-            # Update EMA (skip at step 0, start updating from step 1)
-            # In fairseq line 371: self.ema.step(self.sentence_encoder)
-            # In our case, we step the whole model (since EMA wraps the whole model)
-            if num_updates > 0 and self.ema.get_decay() < 1:
+        elif self.training and self.ema is not None:
+            if self.ema_decay != self.ema_end_decay:
+                if num_updates >= self.ema_anneal_end_step:
+                    decay = self.ema_end_decay
+                else:
+                    decay = get_annealed_rate(
+                        self.ema_decay,
+                        self.ema_end_decay,
+                        num_updates,
+                        self.ema_anneal_end_step,
+                    )
+                self.ema.set_decay(decay)
+            if self.ema.get_decay() < 1:
                 self.ema.step(self)
+    
+    def state_dict(self, destination=None, prefix="", keep_vars=False):
+        """Save state dict including EMA params. Copied from Fairseq."""
+        state = super().state_dict(destination, prefix, keep_vars)
+        if self.ema is not None:
+            state[prefix + "_ema"] = self.ema.fp32_params
+        return state
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        """Load state dict including EMA params. Copied from Fairseq."""
+        if self.ema is not None:
+            k = prefix + "_ema"
+            if k in state_dict:
+                self.ema.restore(state_dict[k], True)
+                del state_dict[k]
+        return super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def forward(
         self,
