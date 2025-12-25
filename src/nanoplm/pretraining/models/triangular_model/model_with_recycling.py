@@ -67,6 +67,7 @@ def sample_negative_binomial(t, target_mean):
 
 class ModernBertForMaskedLMWithRecycling(ModernBertPreTrainedModel):
     _tied_weights_keys = ["decoder.weight"]
+    _keys_to_ignore_on_save = ["model._ema"]  # Exclude EMA module from safetensors save (it's a dict, not tensors)
 
     def __init__(self, config: ModernBertConfig):
         super().__init__(config)
@@ -476,6 +477,8 @@ class ModernBertForMaskedLMWithRecycling(ModernBertPreTrainedModel):
 
 
 class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
+    _keys_to_ignore_on_save = ["_ema"]  # Exclude EMA module from safetensors save (it's a dict, not tensors)
+    
     def __init__(self, config: ModernBertConfig):
         super().__init__(config)
         self.config = config
@@ -691,8 +694,9 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
     def state_dict(self, destination=None, prefix="", keep_vars=False):
         """Save state dict including EMA params. Copied from Fairseq."""
         state = super().state_dict(destination, prefix, keep_vars)
-        if self.ema is not None:
-            state[prefix + "_ema"] = self.ema.fp32_params
+        # Note: We don't add _ema here because it's a dict and safetensors can't handle it
+        # Instead, EMA params should be saved separately if needed (e.g., in a checkpoint callback)
+        # The _keys_to_ignore_on_save ensures _ema is not included in the model save
         return state
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
