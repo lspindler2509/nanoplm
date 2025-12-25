@@ -454,24 +454,25 @@ class ModernBertForMaskedLMWithRecycling(ModernBertPreTrainedModel):
             output = (logits,)
             return ((loss,) + output) if loss is not None else output
 
-        # Prepare output with additional loss fields for logging (if Data2Vec is enabled)
-        output_kwargs = {
-            "loss": loss,
-            "logits": logits,
-            "hidden_states": outputs.hidden_states,
-            "attentions": outputs.attentions,
-        }
+        # Create standard MaskedLMOutput
+        output = MaskedLMOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
         
-        # Add separate loss fields for logging (only if Data2Vec is enabled and labels provided)
+        # Store separate losses as attributes for logging (only if Data2Vec is enabled and labels provided)
+        # Note: We can't add them to MaskedLMOutput as it's a dataclass, so we store them as attributes
         if self.model.use_data2vec and labels is not None:
             # Store MLM loss for logging (detached to avoid gradient issues)
             if mlm_loss is not None:
-                output_kwargs["mlm_loss"] = mlm_loss.detach() if torch.is_tensor(mlm_loss) else mlm_loss
+                output.mlm_loss = mlm_loss.detach() if torch.is_tensor(mlm_loss) else mlm_loss
             # Store Data2Vec loss for logging (detached to avoid gradient issues)
             if d2v_loss is not None:
-                output_kwargs["data2vec_loss"] = d2v_loss.detach() if torch.is_tensor(d2v_loss) else d2v_loss
+                output.data2vec_loss = d2v_loss.detach() if torch.is_tensor(d2v_loss) else d2v_loss
         
-        return MaskedLMOutput(**output_kwargs)
+        return output
 
 
 class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
