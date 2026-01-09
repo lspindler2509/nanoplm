@@ -526,6 +526,11 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
             core_block=core_block,
             coda=coda,
         ))
+        
+        # Monitoring for recycling metrics (copied from RecurrentGPT)
+        self.monitoring = getattr(config, 'monitoring', True)
+        print("Monitoring enabled:", self.monitoring)
+        self.latest_metrics = {}
 
         self.final_norm = nn.LayerNorm(
             config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
@@ -723,6 +728,7 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        num_steps_pair: Optional[torch.Tensor] = None,  # For evaluation with fixed recycling steps
     ) -> Union[tuple[torch.Tensor, ...], BaseModelOutput]:
         r"""
         sliding_window_mask (`torch.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -824,6 +830,11 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
         # Store input_embeds for recycling injection
         input_embeds_for_recycling = hidden_states
         
+        # For evaluation: use _eval_num_steps_pair if set (by MultiStepRecyclingEvalCallback)
+        # Otherwise use num_steps_pair from forward args, or None (which triggers randomized_iteration_sampler)
+        eval_num_steps_pair = getattr(self, '_eval_num_steps_pair', None)
+        steps_to_use = num_steps_pair if num_steps_pair is not None else eval_num_steps_pair
+        
         # Recycling: iterate_forward
         x, num_steps_no_grad, num_steps_with_grad, xk, recycling_attentions = self.iterate_forward(
             input_embeds_for_recycling,
@@ -834,6 +845,7 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
             max_seqlen,
             position_ids=position_ids,
             output_attentions=output_attentions,
+            num_steps_pair=steps_to_use,  # Use eval_num_steps_pair if set, else num_steps_pair from args
         )
         hidden_states = x
         
@@ -864,6 +876,19 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
             all_hidden_states = all_hidden_states + (hidden_states,)
 
         hidden_states = self.final_norm(hidden_states)
+        
+        # Monitor recycling metrics (copied from RecurrentGPT)
+        # x_out: hidden states after final_norm (before prediction head)
+        # x_rec: hidden states after recycling (before coda)
+        # xk: hidden states from previous recycling step
+        if hasattr(self, 'monitoring') and self.monitoring:
+            # xk might be None if no recycling steps were taken, use x as fallback
+            xk_safe = xk if xk is not None else x
+            self.monitor_module(
+                hidden_states, x, xk_safe, input_embeds_for_recycling, 
+                num_steps_no_grad, num_steps_with_grad,
+                cu_seqlens=cu_seqlens
+            )
 
         if repad:
             hidden_states = _pad_modernbert_output(
@@ -1061,7 +1086,6 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
         """
         # Initialize all_self_attentions for recycling block
         all_self_attentions = () if output_attentions else None
-        num_steps_pair = [3, 1]  # TEMPORARY OVERRIDE FOR TESTING
         
         if num_steps_pair is None:
             num_steps_no_grad, num_steps_with_grad = self.randomized_iteration_sampler()
@@ -1125,13 +1149,105 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
                 if output_attentions:
                     all_self_attentions = attentions
         
-        # Apply final layer norm (only for RecurrentGPT-style, not for Boltz2)
-        # In Boltz2, the state is used directly without final normalization (matching Boltz2's behavior)
-        if self.recycling_mode == "boltz2":
-            return x, num_steps_no_grad, num_steps_with_grad, xk.detach(), all_self_attentions
+        # Return state without final norm here - final norm will be applied after coda
+        # This matches ModernBERT behavior: final norm is applied only once, after all layers
+        # Note: recurrentGPT applies ln_f in iterate_forward, but that seems like a bug/inconsistency
+        # We follow ModernBERT convention: final norm only after all layers (coda)
+        return x, num_steps_no_grad, num_steps_with_grad, xk.detach(), all_self_attentions
+    
+    @torch.no_grad()
+    def monitor_module(
+        self,
+        x_out: torch.Tensor,
+        x_rec: torch.Tensor,
+        xk: torch.Tensor,
+        input_embeds: torch.Tensor,
+        num_steps_no_grad: torch.Tensor,
+        num_steps_with_grad: torch.Tensor,
+        cu_seqlens: Optional[torch.Tensor] = None,
+    ):
+        """Monitor recycling metrics. Adapted from RecurrentGPT (model_dynamic.py:1374-1405).
+        
+        Computes metrics to track:
+        - Token correlation (collapse detection)
+        - Hidden state norms (stability)
+        - Recycling residuals (convergence)
+        
+        Supports both 3D tensors (batch, seq_len, hidden_size) and 2D unpadded tensors
+        (total_tokens, hidden_size) from Flash Attention.
+        """
+        # Handle 2D unpadded format (Flash Attention) vs 3D format
+        is_unpadded = x_out.dim() == 2
+        
+        if is_unpadded and cu_seqlens is not None:
+            # 2D format: (total_tokens, hidden_size)
+            # Compute correlation per sequence using cu_seqlens, then average
+            token_corrs = []
+            token_corrs_rec = []
+            
+            for i in range(len(cu_seqlens) - 1):
+                start_idx = cu_seqlens[i]
+                end_idx = cu_seqlens[i + 1]
+                
+                # Extract sequence
+                x_out_seq = x_out[start_idx:end_idx]  # (seq_len_i, hidden_size)
+                x_rec_seq = x_rec[start_idx:end_idx]
+                
+                if x_out_seq.shape[0] > 1:  # Need at least 2 tokens for correlation
+                    # Compute correlation for this sequence
+                    x_out_c = x_out_seq - x_out_seq.mean(dim=-1, keepdim=True)
+                    normed_x = x_out_c / (x_out_c.norm(dim=-1, keepdim=True) + 1e-8)
+                    # (seq_len_i, seq_len_i) correlation matrix
+                    corr_matrix = normed_x @ normed_x.transpose(-2, -1)
+                    # Average off-diagonal elements (exclude self-correlation)
+                    seq_corr = (corr_matrix.sum() - corr_matrix.trace()) / (corr_matrix.numel() - corr_matrix.shape[0])
+                    token_corrs.append(seq_corr)
+                
+                if x_rec_seq.shape[0] > 1:
+                    x_rec_c = x_rec_seq - x_rec_seq.mean(dim=-1, keepdim=True)
+                    normed_x_rec = x_rec_c / (x_rec_c.norm(dim=-1, keepdim=True) + 1e-8)
+                    corr_matrix_rec = normed_x_rec @ normed_x_rec.transpose(-2, -1)
+                    seq_corr_rec = (corr_matrix_rec.sum() - corr_matrix_rec.trace()) / (corr_matrix_rec.numel() - corr_matrix_rec.shape[0])
+                    token_corrs_rec.append(seq_corr_rec)
+            
+            token_corr = torch.stack(token_corrs).mean() if token_corrs else torch.tensor(0.0, device=x_out.device)
+            token_corr_rec = torch.stack(token_corrs_rec).mean() if token_corrs_rec else torch.tensor(0.0, device=x_rec.device)
         else:
-            # RecurrentGPT-style: apply final layer norm (applied both here and after coda)
-            return self.final_norm(x), num_steps_no_grad, num_steps_with_grad, xk.detach(), all_self_attentions
+            # 3D format: (batch, seq_len, hidden_size) or fallback for 2D without cu_seqlens
+            if x_out.dim() == 2:
+                # 2D without cu_seqlens: compute correlation over all tokens (less accurate but works)
+                x_out_c = x_out - x_out.mean(dim=-1, keepdim=True)
+                normed_x = x_out_c / (x_out_c.norm(dim=-1, keepdim=True) + 1e-8)
+                corr_matrix = normed_x @ normed_x.transpose(-2, -1)
+                token_corr = (corr_matrix.sum() - corr_matrix.trace()) / (corr_matrix.numel() - corr_matrix.shape[0]) if corr_matrix.shape[0] > 1 else torch.tensor(0.0, device=x_out.device)
+                
+                x_rec_c = x_rec - x_rec.mean(dim=-1, keepdim=True)
+                normed_x_rec = x_rec_c / (x_rec_c.norm(dim=-1, keepdim=True) + 1e-8)
+                corr_matrix_rec = normed_x_rec @ normed_x_rec.transpose(-2, -1)
+                token_corr_rec = (corr_matrix_rec.sum() - corr_matrix_rec.trace()) / (corr_matrix_rec.numel() - corr_matrix_rec.shape[0]) if corr_matrix_rec.shape[0] > 1 else torch.tensor(0.0, device=x_rec.device)
+            else:
+                # 3D format: standard computation
+                x_out_c = x_out - x_out.mean(dim=-1, keepdim=True)
+                normed_x = x_out_c / (x_out_c.norm(dim=-1, keepdim=True) + 1e-8)
+                token_corr = (normed_x @ normed_x.transpose(-2, -1)).mean() - 1 / x_out.shape[1]
+
+                x_rec_c = x_rec - x_rec.mean(dim=-1, keepdim=True)
+                normed_x_rec = x_rec_c / (x_rec_c.norm(dim=-1, keepdim=True) + 1e-8)
+                token_corr_rec = (normed_x_rec @ normed_x_rec.transpose(-2, -1)).mean() - 1 / x_rec.shape[1]
+        
+        # Store metrics
+        metrics = {
+            "last_hidden_token_corr": token_corr.item() if isinstance(token_corr, torch.Tensor) else token_corr,
+            "recurrent_state_token_corr": token_corr_rec.item() if isinstance(token_corr_rec, torch.Tensor) else token_corr_rec,
+            "last_hidden_norm": x_out.norm(dim=-1).mean().item(),
+            "recurrent_state_norm": x_rec.norm(dim=-1).mean().item(),
+            "recurrent_diff": (x_rec - input_embeds).norm(dim=-1).mean().item(),
+            "num_steps_no_grad": num_steps_no_grad.item() if isinstance(num_steps_no_grad, torch.Tensor) else num_steps_no_grad,
+            "num_steps_with_grad": num_steps_with_grad.item() if isinstance(num_steps_with_grad, torch.Tensor) else num_steps_with_grad,
+            "recurrent_residual": (x_rec - xk).norm(dim=-1).mean().item(),
+            "rel_residual": ((x_rec - xk).norm(dim=-1) / (x_rec.norm(dim=-1) + 1e-8)).mean().item(),
+        }
+        self.latest_metrics = metrics  # Will be picked up by monitoring callback
     
     def core_block_forward(self, x, input_embeds, position_embeddings, attention_mask, sliding_window_mask, cu_seqlens, max_seqlen, position_ids: Optional[torch.LongTensor], output_attentions: Optional[bool], step: Union[torch.Tensor, int], all_self_attentions: Optional[tuple] = None):
         """One iteration through core_block. Adapted from RecurrentGPT."""

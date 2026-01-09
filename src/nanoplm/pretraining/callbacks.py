@@ -124,3 +124,150 @@ class Data2VecLossLoggingCallback(TrainerCallback):
         
         return control
 
+
+class MultiStepRecyclingEvalCallback(TrainerCallback):
+    """Callback to evaluate with different recycling step counts (1 to mean_recurrence).
+    
+    After the normal evaluation, this callback runs additional evaluations with
+    fixed recycling steps (1, 2, ..., mean_recurrence) and logs results to WandB
+    with suffixes like eval_loss_steps_1, eval_loss_steps_2, etc.
+    """
+    
+    def __init__(self, enabled: bool = True, trainer=None):
+        """
+        Args:
+            enabled: Whether to enable multi-step evaluation (default: True)
+            trainer: Optional Trainer instance. If None, will try to get from kwargs or state.
+        """
+        self.enabled = enabled
+        self.trainer = trainer
+        self._in_nested_eval = False
+    
+    def on_init_end(self, args, state: TrainerState, control: TrainerControl, **kwargs):
+        """Store trainer reference when available."""
+        # Try to get trainer from kwargs (some versions pass it)
+        if self.trainer is None:
+            self.trainer = kwargs.get('trainer')
+    
+    def on_evaluate(self, args, state: TrainerState, control: TrainerControl, model=None, **kwargs):
+        """Run additional evaluations with different recycling step counts."""
+        if self._in_nested_eval or not self.enabled or model is None:
+            return
+        
+        # Try to get trainer from various sources
+        trainer = self.trainer
+        if trainer is None:
+            # Try kwargs (some HuggingFace versions might pass it)
+            trainer = kwargs.get('trainer')
+        if trainer is None:
+            # Try to get from state if available (not standard, but worth trying)
+            if hasattr(state, 'trainer'):
+                trainer = state.trainer
+        
+        if trainer is None:
+            print("MultiStepRecyclingEvalCallback: trainer not found. Please pass trainer in __init__ or ensure it's available.")
+            return
+        
+        # Get mean_recurrence from model config
+        mean_recurrence = None
+        if hasattr(model, 'bert_model') and hasattr(model.bert_model, 'model'):
+            mean_recurrence = getattr(model.bert_model.model.config, 'mean_recurrence', None)
+                
+        # Get eval dataset from trainer
+        # Note: HuggingFace Trainer stores eval_dataset, but it might be a dict for multiple eval datasets
+        eval_dataset = trainer.eval_dataset
+
+        self._in_nested_eval = True
+        
+        # Run evaluation for each step count
+        for num_steps in range(1, mean_recurrence + 1):
+            
+            # Run evaluation
+            model.bert_model.config.mean_recurrence = num_steps
+            model.bert_model.model.eval()
+            with torch.no_grad():
+                eval_results = trainer.evaluate(eval_dataset=eval_dataset)
+
+            # Store results for this step count
+            if wandb.run is not None:
+                for key, value in eval_results.items():
+                    if 'loss' in key:
+                        wandb.log({f"eval_recycling_steps/{key}_{num_steps}": value})
+            if num_steps == mean_recurrence:
+                self._in_nested_eval = False
+        
+        return control
+
+
+class RecyclingMetricsCallback(TrainerCallback):
+    """Callback to log recycling metrics from model.monitor_module.
+    
+    Similar to RecurrentGPT's monitoring system, this callback collects
+    metrics computed by monitor_module and logs them to WandB.
+    """
+    
+    def __init__(self, enabled: bool = True, log_interval: int = 1):
+        """
+        Args:
+            enabled: Whether to enable recycling metrics logging (default: True)
+            log_interval: Log metrics every N steps (default: 1, log every step)
+        """
+        self.enabled = enabled
+        self.log_interval = log_interval
+    
+    def on_log(
+        self,
+        args,
+        state: TrainerState,
+        control: TrainerControl,
+        model=None,
+        logs: Optional[dict] = None,
+        **kwargs
+    ):
+        """Collect and log recycling metrics from the model."""
+        if not self.enabled or model is None:
+            return
+        
+        # Check if we should log this step
+        if state.global_step % self.log_interval != 0:
+            return
+        
+        mean_recurrence = None
+        if hasattr(model, 'bert_model') and hasattr(model.bert_model, 'model'):
+            mean_recurrence = getattr(model.bert_model.model.config, 'mean_recurrence', None)
+        
+        # Determine if this is evaluation or training based on log keys
+        # HuggingFace adds "eval_" prefix to evaluation metrics
+        is_eval = logs is not None and any(k.startswith("eval_") for k in logs.keys())
+        prefix = "eval_recycling/" if is_eval else "train_recycling/"
+        
+        # Get the underlying model (might be wrapped)
+        base_model = model
+        if hasattr(model, 'bert_model'):
+            base_model = model.bert_model
+        if hasattr(base_model, 'model'):
+            base_model = base_model.model
+        
+        # Check if model has latest_metrics
+        if not hasattr(base_model, 'latest_metrics'):
+            return
+        
+        metrics = base_model.latest_metrics
+        if not metrics:
+            return
+        
+        # Log metrics to WandB with prefix (train/ or eval/)
+        if wandb.run is not None:
+            recycling_metrics = {}
+            for key, value in metrics.items():
+                if isinstance(value, (int, float)):
+                    if is_eval:
+                        recycling_metrics[f"{prefix}{key}_{mean_recurrence}"] = value
+                    else:
+                        recycling_metrics[f"{prefix}{key}"] = value
+
+            if recycling_metrics:
+                wandb.log(recycling_metrics)
+        
+        return control
+
