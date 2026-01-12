@@ -545,14 +545,15 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
         # Recycling mode: "recurrentgpt" (default) or "boltz2" (additive recycling)
         self.recycling_mode = getattr(config, 'recycling_mode', 'recurrentgpt')
         
+        # s_norm: LayerNorm for state normalization
+        self.s_norm = nn.LayerNorm(config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
+        
         # Boltz2-style additive recycling components (only if recycling_mode == "boltz2")
         if self.recycling_mode == "boltz2":
             # s_init: Projection from input embeddings to initial state
             s_init = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
             s_init._is_s_init = True  # Mark for special initialization
             self.s_init = s_init
-            # s_norm: LayerNorm for state normalization
-            self.s_norm = nn.LayerNorm(config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
             # s_recycle: Recycling projection (initialized to 0, like gating_init_)
             self.s_recycle = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
             # Initialize s_recycle to 0 (like Boltz2's gating_init_)
@@ -1255,6 +1256,7 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
         # In Boltz2 mode, the state already contains input information via s_init,
         # so no additional injection is needed (matching Boltz2's pairformer behavior)
         if self.recycling_mode != "boltz2":
+            #x = self.s_norm(x).to(x.dtype)
             if self.config.injection_type == "add":
                 x = x + input_embeds
             elif self.config.injection_type == "gate":
@@ -1442,6 +1444,8 @@ class ModernBertEncoderLayer(GradientCheckpointingLayer):
             config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
         self.mlp = ModernBertMLP(config)
         self.attention_type = config.layer_types[layer_id]
+        self.finalNorm = nn.LayerNorm(
+            config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
 
     @torch.compile(dynamic=True)
     def compiled_mlp(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1475,6 +1479,7 @@ class ModernBertEncoderLayer(GradientCheckpointingLayer):
             else self.mlp(self.mlp_norm(hidden_states))
         )
         hidden_states = hidden_states + mlp_output
+        hidden_states = self.finalNorm(hidden_states).to(hidden_states.dtype)
 
         # add attentions if outputted
         return (hidden_states,) + attn_outputs[1:]
@@ -2084,3 +2089,22 @@ def rotate_half(x):
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2:]
     return torch.cat((-x2, x1), dim=-1)
+
+
+class RMSNorm_llama(torch.nn.Module):
+    """Saner dtype handling and slightly better for fusion"""
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = torch.nn.Parameter(torch.ones(dim))
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        with torch.autocast(enabled=False, device_type=x.device.type):
+            return self._norm(x.float()).type_as(x) * self.weight
+
+    def reset_parameters(self) -> None:
+        torch.nn.init.ones_(self.weight)
