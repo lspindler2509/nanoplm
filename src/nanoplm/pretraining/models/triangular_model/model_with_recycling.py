@@ -126,6 +126,8 @@ class ModernBertForMaskedLMWithRecycling(ModernBertPreTrainedModel):
             module.weight.data.fill_(1.0)
             if module.bias is not None:
                 module.bias.data.zero_()
+        elif isinstance(module, nn.RMSNorm):
+            module.weight.data.fill_(1.0)
 
     def get_output_embeddings(self):
         return self.decoder
@@ -532,8 +534,8 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
         print("Monitoring enabled:", self.monitoring)
         self.latest_metrics = {}
 
-        self.final_norm = nn.LayerNorm(
-            config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
+        self.final_norm = nn.RMSNorm(
+            config.hidden_size, eps=config.norm_eps)
         self.rotary_emb = ModernBertRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
         
@@ -545,15 +547,14 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
         # Recycling mode: "recurrentgpt" (default) or "boltz2" (additive recycling)
         self.recycling_mode = getattr(config, 'recycling_mode', 'recurrentgpt')
         
-        # s_norm: LayerNorm for state normalization
-        self.s_norm = nn.LayerNorm(config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
-        
         # Boltz2-style additive recycling components (only if recycling_mode == "boltz2")
         if self.recycling_mode == "boltz2":
             # s_init: Projection from input embeddings to initial state
             s_init = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
             s_init._is_s_init = True  # Mark for special initialization
             self.s_init = s_init
+            # s_norm: RMSNorm for state normalization
+            self.s_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
             # s_recycle: Recycling projection (initialized to 0, like gating_init_)
             self.s_recycle = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
             # Initialize s_recycle to 0 (like Boltz2's gating_init_)
@@ -645,6 +646,8 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
             module.weight.data.fill_(1.0)
             if module.bias is not None:
                 module.bias.data.zero_()
+        elif isinstance(module, nn.RMSNorm):
+            module.weight.data.fill_(1.0)
 
     def get_input_embeddings(self):
         return self.embeddings.tok_embeddings
@@ -1328,8 +1331,8 @@ class ModernBertPredictionHead(nn.Module):
         self.dense = nn.Linear(
             config.hidden_size, config.hidden_size, config.classifier_bias)
         self.act = ACT2FN[config.classifier_activation]
-        self.norm = nn.LayerNorm(
-            config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
+        self.norm = nn.RMSNorm(
+            config.hidden_size, eps=config.norm_eps)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.norm(self.act(self.dense(hidden_states)))
@@ -1345,8 +1348,8 @@ class ModernBertEmbeddings(nn.Module):
         self.config = config
         self.tok_embeddings = nn.Embedding(
             config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
-        self.norm = nn.LayerNorm(
-            config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
+        self.norm = nn.RMSNorm(
+            config.hidden_size, eps=config.norm_eps)
         self.drop = nn.Dropout(config.embedding_dropout)
 
     @torch.compile(dynamic=True)
@@ -1437,15 +1440,15 @@ class ModernBertEncoderLayer(GradientCheckpointingLayer):
         if layer_id == 0:
             self.attn_norm = nn.Identity()
         else:
-            self.attn_norm = nn.LayerNorm(
-                config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
+            self.attn_norm = nn.RMSNorm(
+                config.hidden_size, eps=config.norm_eps)
         self.attn = ModernBertAttention(config=config, layer_id=layer_id)
-        self.mlp_norm = nn.LayerNorm(
-            config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
+        self.mlp_norm = nn.RMSNorm(
+            config.hidden_size, eps=config.norm_eps)
         self.mlp = ModernBertMLP(config)
         self.attention_type = config.layer_types[layer_id]
-        self.finalNorm = nn.LayerNorm(
-            config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
+        self.finalNorm = nn.RMSNorm(
+            config.hidden_size, eps=config.norm_eps)
 
     @torch.compile(dynamic=True)
     def compiled_mlp(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -2090,21 +2093,3 @@ def rotate_half(x):
     x2 = x[..., x.shape[-1] // 2:]
     return torch.cat((-x2, x1), dim=-1)
 
-
-class RMSNorm_llama(torch.nn.Module):
-    """Saner dtype handling and slightly better for fusion"""
-
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = torch.nn.Parameter(torch.ones(dim))
-
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
-    def forward(self, x):
-        with torch.autocast(enabled=False, device_type=x.device.type):
-            return self._norm(x.float()).type_as(x) * self.weight
-
-    def reset_parameters(self) -> None:
-        torch.nn.init.ones_(self.weight)
