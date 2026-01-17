@@ -179,9 +179,11 @@ class MultiStepRecyclingEvalCallback(TrainerCallback):
 
         self._in_nested_eval = True
         
+        # Hardcoded step counts to evaluate: 1, 4, 8, and mean_recurrence (typically 12)
+        step_counts = [1, 4, 8, mean_recurrence]
+        
         # Run evaluation for each step count
-        for num_steps in range(1, mean_recurrence + 1):
-            
+        for num_steps in step_counts:
             # Run evaluation
             model.bert_model.config.mean_recurrence = num_steps
             model.bert_model.model.eval()
@@ -268,6 +270,11 @@ class RecyclingMetricsCallback(TrainerCallback):
 
             if recycling_metrics:
                 wandb.log(recycling_metrics)
+        
+        # Reset accumulator after logging (for next step)
+        if hasattr(base_model, '_metrics_accumulator'):
+            base_model._metrics_accumulator = {}
+            base_model._metrics_count = 0
         
         return control
 

@@ -533,6 +533,8 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
         self.monitoring = getattr(config, 'monitoring', True)
         print("Monitoring enabled:", self.monitoring)
         self.latest_metrics = {}
+        self._metrics_accumulator = {}  # Accumulate metrics across batches in a step
+        self._metrics_count = 0  # Count batches accumulated
 
         self.final_norm = nn.RMSNorm(
             config.hidden_size, eps=config.norm_eps)
@@ -852,6 +854,7 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
             num_steps_pair=steps_to_use,  # Use eval_num_steps_pair if set, else num_steps_pair from args
         )
         hidden_states = x
+        hidden_states = self.final_norm(hidden_states)
         
         # Add recycling attentions to all_self_attentions
         if output_attentions and recycling_attentions is not None:
@@ -1251,7 +1254,34 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
             "recurrent_residual": (x_rec - xk).norm(dim=-1).mean().item(),
             "rel_residual": ((x_rec - xk).norm(dim=-1) / (x_rec.norm(dim=-1) + 1e-8)).mean().item(),
         }
-        self.latest_metrics = metrics  # Will be picked up by monitoring callback
+        
+        # Accumulate metrics across batches (for gradient accumulation)
+        # This ensures we see the distribution of sampled values, not just the last one
+        if not hasattr(self, '_metrics_accumulator'):
+            self._metrics_accumulator = {}
+            self._metrics_count = 0
+        
+        for key, value in metrics.items():
+            if key not in self._metrics_accumulator:
+                self._metrics_accumulator[key] = []
+            self._metrics_accumulator[key].append(value)
+        
+        self._metrics_count += 1
+        
+        # Compute averages for continuous metrics, but keep individual values for discrete ones
+        # For num_steps, we want to see the distribution, so we'll log both mean and individual values
+        averaged_metrics = {}
+        for key, values in self._metrics_accumulator.items():
+            if key in ["num_steps_no_grad", "num_steps_with_grad"]:
+                # For discrete values, compute mean and also track min/max to see range
+                averaged_metrics[key] = sum(values) / len(values)
+                averaged_metrics[f"{key}_min"] = min(values)
+                averaged_metrics[f"{key}_max"] = max(values)
+            else:
+                # For continuous metrics, use average
+                averaged_metrics[key] = sum(values) / len(values)
+        
+        self.latest_metrics = averaged_metrics  # Will be picked up by monitoring callback
     
     def core_block_forward(self, x, input_embeds, position_embeddings, attention_mask, sliding_window_mask, cu_seqlens, max_seqlen, position_ids: Optional[torch.LongTensor], output_attentions: Optional[bool], step: Union[torch.Tensor, int], all_self_attentions: Optional[tuple] = None):
         """One iteration through core_block. Adapted from RecurrentGPT."""
