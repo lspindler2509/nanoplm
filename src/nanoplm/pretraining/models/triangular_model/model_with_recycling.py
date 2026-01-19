@@ -931,8 +931,16 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
         """Outputs are long tensors so that they can be passed through compiled functions.
         Copied from RecurrentGPT.
         """
-        seed_n = 514229 + self.step  # easiest way to make the sampler re-runnable in checkpointing
-        seed_k = 317811 + self.step
+        # Use a global counter to vary seed per batch call
+        # This ensures different batches get different values, even within the same step
+        # (which is important for gradient accumulation where multiple batches belong to one step)
+        if not hasattr(self, '_sampler_call_counter'):
+            self._sampler_call_counter = 0
+        batch_offset = self._sampler_call_counter
+        self._sampler_call_counter += 1
+        
+        seed_n = 22 + self.step * 1000 + batch_offset
+        seed_k = 3 + self.step * 1000 + batch_offset
         lockstep_n = getattr(self.config, 'lockstep_n', False)
         lockstep_k = getattr(self.config, 'lockstep_k', False)
         if not lockstep_n and torch.distributed.is_initialized():
