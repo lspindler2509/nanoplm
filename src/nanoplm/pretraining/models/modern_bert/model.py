@@ -8,6 +8,7 @@ from transformers import ModernBertConfig, ModernBertForMaskedLM
 from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
 from nanoplm.pretraining.models.triangular_model.model_withTriangularAttention import ModernBertForMaskedLMWithTriangularAttention
 from nanoplm.pretraining.models.triangular_model.model_with_recycling import ModernBertForMaskedLMWithRecycling
+from nanoplm.pretraining.models.triangular_model.model_with_data2vec import ModernBertForMaskedLMWithData2Vec
 
 @dataclass
 class ProtModernBertMLMConfig:
@@ -68,12 +69,18 @@ class ProtModernBertMLM(nn.Module):
         self.tokenizer = ProtModernBertTokenizer()
         self.use_triangular_attention = config.use_triangular_attention
         self.recycling = config.recycling
+        self.use_data2vec = config.use_data2vec
         
         # Validate: only one of recycling or triangular_attention can be True
         if self.recycling and self.use_triangular_attention:
             raise ValueError(
                 "recycling and use_triangular_attention cannot both be True. "
                 "Please choose one: either recycling=True OR use_triangular_attention=True"
+            )
+        if self.use_data2vec and self.use_triangular_attention:
+            raise ValueError(
+                "use_data2vec and use_triangular_attention cannot both be True. "
+                "Please choose one: either use_data2vec=True OR use_triangular_attention=True"
             )
         
         # Validate recycling parameters (required only if recycling=True)
@@ -181,6 +188,24 @@ class ProtModernBertMLM(nn.Module):
                     print(f"{name}: mean={param.data.mean():.6f}, std={param.data.std():.6f}")
                     if param.data.std() > 10.0 or param.data.mean().abs() > 1.0:
                         print(f"⚠️  PROBLEMATIC: {name}")
+        elif self.use_data2vec and not self.recycling and not self.use_triangular_attention:
+            print("📊 Building ModernBERT architecture with Data2Vec (no recycling, no triangular attention)")
+            # Pass Data2Vec config to ModernBertConfig
+            self.config.use_data2vec = config.use_data2vec
+            self.config.average_top_k_layers = config.average_top_k_layers
+            self.config.ema_decay = config.ema_decay
+            self.config.ema_end_decay = config.ema_end_decay
+            self.config.ema_anneal_end_step = config.ema_anneal_end_step
+            self.config.data2vec_loss_weight = config.data2vec_loss_weight
+            self.config.data2vec_loss_scale = config.data2vec_loss_scale
+            self.config.data2vec_layer_norm_targets = config.data2vec_layer_norm_targets
+            self.config.data2vec_instance_norm_targets = config.data2vec_instance_norm_targets
+            self.config.data2vec_head_layers = getattr(config, 'data2vec_head_layers', 1)
+            self.config.ema_transformer_layers_only = getattr(config, 'ema_transformer_layers_only', False)
+            self.config.data2vec_layer_norm_target_layer = getattr(config, 'data2vec_layer_norm_target_layer', False)
+            self.config.data2vec_instance_norm_target_layer = getattr(config, 'data2vec_instance_norm_target_layer', False)
+            self.config.data2vec_batch_norm_target_layer = getattr(config, 'data2vec_batch_norm_target_layer', False)
+            self.bert_model = ModernBertForMaskedLMWithData2Vec(self.config)
         else:
             print("🔧 Building STANDARD ModernBERT architecture")
             self.bert_model = ModernBertForMaskedLM(self.config)  
