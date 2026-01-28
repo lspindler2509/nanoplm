@@ -24,8 +24,6 @@ from nanoplm.pretraining.dataset import (
 )
 from nanoplm.pretraining.collator import ProtDataCollatorForLM
 from nanoplm.pretraining.callbacks import ParameterLoggingCallback
-from nanoplm.pretraining.callbacks import MultiStepRecyclingEvalCallback
-from nanoplm.pretraining.callbacks import RecyclingMetricsCallback
 from nanoplm.utils.logger import logger
 from nanoplm.utils.common import get_device, create_dirs
 
@@ -362,9 +360,15 @@ def run_pretraining(
     
     # Create callbacks
     callbacks = []
-    multi_step_callback = MultiStepRecyclingEvalCallback()
-    callbacks.append(multi_step_callback)
-    callbacks.append(RecyclingMetricsCallback())
+    
+    # Recycling callbacks (only if recycling is enabled)
+    use_recycling = getattr(model, 'recycling', False)
+    if use_recycling:
+        from nanoplm.pretraining.callbacks import MultiStepRecyclingEvalCallback, RecyclingMetricsCallback
+        multi_step_callback = MultiStepRecyclingEvalCallback()
+        callbacks.append(multi_step_callback)
+        callbacks.append(RecyclingMetricsCallback())
+        logger.info("Recycling enabled: Multi-step evaluation and recycling metrics will be logged")
     
     # Data2Vec callbacks (if Data2Vec is enabled)
     # Structure: ProtModernBertMLM -> bert_model (ModernBertForMaskedLMWithRecycling) -> model (ModernBertModelWithRecycling)
