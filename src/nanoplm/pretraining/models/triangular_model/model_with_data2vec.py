@@ -247,34 +247,13 @@ class ModernBertForMaskedLMWithData2Vec(ModernBertPreTrainedModel):
             x = self.model.regression_head(student_hidden[mask_tokens])
             y = target_masked
         
-        # Loss computation (following fairseq Data2Vec implementation exactly, lines 474-480)
-        # Use reduction='none' to sum over features dimension
-        sz = x.size(-1)  # hidden_size (feature dimension)
-        loss_beta = getattr(self.model.config, 'data2vec_loss_beta', 0.0)
-        if loss_beta == 0:
-            # MSE Loss (fairseq line 476)
-            loss = F.mse_loss(x.float(), y.float(), reduction="none").sum(dim=-1)
-        else:
-            # Smooth L1 Loss (fairseq lines 478-480)
-            loss = F.smooth_l1_loss(
-                x.float(), y.float(), reduction="none", beta=loss_beta
-            ).sum(dim=-1)
-        
-        # Scale loss exactly as in fairseq (line 484-486)
-        loss_scale = getattr(self.model.config, 'data2vec_loss_scale', -1.0)
-        if loss_scale <= 0:
-            # Default: scale by 1/sqrt(hidden_size) as in fairseq (line 484)
-            d2v_loss = loss.sum() / math.sqrt(sz)
-        else:
-            # Use explicit loss_scale if provided (line 486)
-            d2v_loss = loss.sum() * loss_scale
-        
-        # Normalize by sample_size (num_masked * hidden_size) to match Fairseq
-        # Fairseq divides gradients by sample_size in trainer (trainer.py:946)
-        # We normalize the loss directly here since HuggingFace Trainer doesn't do this
-        sample_size = loss.numel()  # = num_masked * hidden_size (same as Fairseq line 488)
-        if sample_size > 0:
-            d2v_loss = d2v_loss / sample_size
+        # Loss computation using Cosine Similarity Loss (like JEPA)
+        # Compute cosine similarity between student prediction and teacher target
+        # x and y have shape (num_masked_tokens, hidden_size)
+        cosine_similarity = F.cosine_similarity(x.float(), y.float(), dim=-1)
+        # Cosine similarity loss: 1 - mean(cosine_similarity), Range: [0, 2]
+        # 0 = perfect alignment, 2 = opposite directions
+        d2v_loss = 1.0 - torch.mean(cosine_similarity)
         
         return d2v_loss
 
@@ -400,7 +379,7 @@ class ModernBertForMaskedLMWithData2Vec(ModernBertPreTrainedModel):
                 )
                 if d2v_loss is not None:
                     # Combine losses (weighted)
-                    d2v_weight = getattr(self.config, 'data2vec_loss_weight', 0.5)
+                    d2v_weight = getattr(self.config, 'data2vec_loss_weight', 2.0)
                     loss = loss + d2v_weight * d2v_loss
 
         if self.config._attn_implementation == "flash_attention_2":
