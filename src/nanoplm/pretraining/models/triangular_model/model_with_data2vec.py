@@ -577,6 +577,7 @@ class ModernBertModelWithData2Vec(ModernBertPreTrainedModel):
     
     def set_num_updates(self, num_updates):
         """Update EMA decay rate and step EMA teacher for Data2Vec. Copied from Fairseq."""
+        super().set_num_updates(num_updates)
         if self.ema is None and self.regression_head is not None:
             logger.info(f"making ema teacher")
             self.make_ema_teacher()

@@ -297,6 +297,7 @@ def run_pretraining(
         "seed": pretrain_config.seed,
         "report_to": "wandb",
         "run_name": run_name,
+        "include_num_input_tokens_seen": "non_padding",  # all, no
         "dataloader_pin_memory": True if device == "cuda" else False,
         "dataloader_num_workers": num_workers,
         "dataloader_persistent_workers": False,
