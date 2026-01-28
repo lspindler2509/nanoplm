@@ -106,21 +106,25 @@ class Data2VecLossLoggingCallback(TrainerCallback):
             
             if bert_model is not None:
                 loss_logs = {}
-                # Extract MLM loss if available
-                if hasattr(bert_model, '_last_mlm_loss') and bert_model._last_mlm_loss is not None:
-                    loss_logs[f"{prefix}mlm_loss"] = bert_model._last_mlm_loss
                 
-                # Extract Data2Vec loss if available
-                if hasattr(bert_model, '_last_d2v_loss') and bert_model._last_d2v_loss is not None:
-                    loss_logs[f"{prefix}data2vec_loss"] = bert_model._last_d2v_loss
-                    # Get data2vec_loss_weight from config
-                    d2v_weight = 0.5
-                    if hasattr(bert_model, 'config'):
-                        d2v_weight = getattr(bert_model.config, 'data2vec_loss_weight', 0.5)
-                    loss_logs[f"{prefix}data2vec_loss_weighted"] = bert_model._last_d2v_loss * d2v_weight
+                # Compute average MLM loss from accumulator (across batches in gradient accumulation)
+                if hasattr(bert_model, '_mlm_loss_accumulator') and bert_model._mlm_loss_accumulator:
+                    avg_mlm_loss = sum(bert_model._mlm_loss_accumulator) / len(bert_model._mlm_loss_accumulator)
+                    loss_logs[f"{prefix}mlm_loss"] = avg_mlm_loss
                 
+                # Compute average Data2Vec loss from accumulator (across batches in gradient accumulation)
+                if hasattr(bert_model, '_d2v_loss_accumulator') and bert_model._d2v_loss_accumulator:
+                    avg_d2v_loss = sum(bert_model._d2v_loss_accumulator) / len(bert_model._d2v_loss_accumulator)
+                    loss_logs[f"{prefix}data2vec_loss"] = avg_d2v_loss
+
                 if loss_logs:
                     wandb.log(loss_logs)
+                
+                # Reset accumulators after logging (for next logging interval)
+                if hasattr(bert_model, '_mlm_loss_accumulator'):
+                    bert_model._mlm_loss_accumulator = []
+                if hasattr(bert_model, '_d2v_loss_accumulator'):
+                    bert_model._d2v_loss_accumulator = []
         
         return control
 

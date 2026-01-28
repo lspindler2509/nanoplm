@@ -413,13 +413,22 @@ class ModernBertForMaskedLMWithData2Vec(ModernBertPreTrainedModel):
         
         # Store separate losses in self for logging (only if Data2Vec is enabled and labels provided)
         # Note: We can't add them to MaskedLMOutput as it's a dataclass, so we store them in the model instance
+        # Accumulate losses across batches (for gradient accumulation) - similar to RecyclingMetricsCallback
         if self.model.use_data2vec and labels is not None:
-            # Store MLM loss for logging (detached to avoid gradient issues)
+            # Initialize accumulators if they don't exist
+            if not hasattr(self, '_mlm_loss_accumulator'):
+                self._mlm_loss_accumulator = []
+                self._d2v_loss_accumulator = []
+            
+            # Accumulate MLM loss for logging (detached to avoid gradient issues)
             if mlm_loss is not None:
-                self._last_mlm_loss = mlm_loss.detach().item() if torch.is_tensor(mlm_loss) else mlm_loss
-            # Store Data2Vec loss for logging (detached to avoid gradient issues)
+                mlm_loss_val = mlm_loss.detach().item() if torch.is_tensor(mlm_loss) else mlm_loss
+                self._mlm_loss_accumulator.append(mlm_loss_val)
+            
+            # Accumulate Data2Vec loss for logging (detached to avoid gradient issues)
             if d2v_loss is not None:
-                self._last_d2v_loss = d2v_loss.detach().item() if torch.is_tensor(d2v_loss) else d2v_loss
+                d2v_loss_val = d2v_loss.detach().item() if torch.is_tensor(d2v_loss) else d2v_loss
+                self._d2v_loss_accumulator.append(d2v_loss_val)
         
         return output
 
