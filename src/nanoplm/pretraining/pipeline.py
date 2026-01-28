@@ -360,6 +360,7 @@ def run_pretraining(
     
     # Create callbacks
     callbacks = []
+    multi_step_callback = None  # Initialize to None
     
     # Recycling callbacks (only if recycling is enabled)
     use_recycling = getattr(model, 'recycling', False)
