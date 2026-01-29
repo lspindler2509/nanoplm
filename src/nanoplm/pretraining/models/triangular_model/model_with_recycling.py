@@ -447,22 +447,32 @@ class ModernBertForMaskedLMWithRecycling(ModernBertPreTrainedModel):
         # Store separate losses in self for logging (only if Data2Vec is enabled and labels provided)
         # Note: We can't add them to MaskedLMOutput as it's a dataclass, so we store them in the model instance
         # Accumulate losses across batches (for gradient accumulation) - similar to RecyclingMetricsCallback
-        # IMPORTANT: Only accumulate during training, not during evaluation
-        if self.model.use_data2vec and labels is not None and self.training:
+        # IMPORTANT: Separate accumulators for training and evaluation
+        if self.model.use_data2vec and labels is not None:
             # Initialize accumulators if they don't exist
-            if not hasattr(self, '_mlm_loss_accumulator'):
-                self._mlm_loss_accumulator = []
-                self._d2v_loss_accumulator = []
+            if not hasattr(self, '_train_mlm_loss_accumulator'):
+                self._train_mlm_loss_accumulator = []
+                self._train_d2v_loss_accumulator = []
+                self._eval_mlm_loss_accumulator = []
+                self._eval_d2v_loss_accumulator = []
+            
+            # Choose accumulator based on training mode
+            if self.training:
+                mlm_acc = self._train_mlm_loss_accumulator
+                d2v_acc = self._train_d2v_loss_accumulator
+            else:
+                mlm_acc = self._eval_mlm_loss_accumulator
+                d2v_acc = self._eval_d2v_loss_accumulator
             
             # Accumulate MLM loss for logging (detached to avoid gradient issues)
             if mlm_loss is not None:
                 mlm_loss_val = mlm_loss.detach().item() if torch.is_tensor(mlm_loss) else mlm_loss
-                self._mlm_loss_accumulator.append(mlm_loss_val)
+                mlm_acc.append(mlm_loss_val)
             
             # Accumulate Data2Vec loss for logging (detached to avoid gradient issues)
             if d2v_loss is not None:
                 d2v_loss_val = d2v_loss.detach().item() if torch.is_tensor(d2v_loss) else d2v_loss
-                self._d2v_loss_accumulator.append(d2v_loss_val)
+                d2v_acc.append(d2v_loss_val)
         
         return output
 
