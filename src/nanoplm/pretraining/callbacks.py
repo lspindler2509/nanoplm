@@ -107,14 +107,40 @@ class Data2VecLossLoggingCallback(TrainerCallback):
             if bert_model is not None:
                 loss_logs = {}
                 
-                # Compute average MLM loss from accumulator (across batches in gradient accumulation)
+                # The Trainer normalizes loss by gradient_accumulation_steps in training_step (line 3830),
+                # then sums: tr_loss = tr_loss + tr_loss_step (line 2550),
+                # then divides by steps since last log: logs["loss"] = tr_loss_scalar / (self.state.global_step - self._globalstep_last_logged) (line 3004)
+                # We store raw losses per batch, so we need to normalize them the same way
+                gradient_accumulation_steps = getattr(args, 'gradient_accumulation_steps', 1)
+                
+                # Calculate number of steps since last log
+                # Each batch corresponds to one accumulation step, so num_batches / gradient_accumulation_steps = num_steps
+                # We use the number of batches in the accumulator as a proxy for steps since last log
+                # This is accurate because we reset the accumulator after each log
+                num_batches_mlm = len(bert_model._mlm_loss_accumulator) if hasattr(bert_model, '_mlm_loss_accumulator') and bert_model._mlm_loss_accumulator else 0
+                num_batches_d2v = len(bert_model._d2v_loss_accumulator) if hasattr(bert_model, '_d2v_loss_accumulator') and bert_model._d2v_loss_accumulator else 0
+                # Use the maximum to handle cases where one accumulator might be empty
+                num_batches = max(num_batches_mlm, num_batches_d2v)
+                # Number of steps = number of batches / gradient_accumulation_steps
+                steps_since_last_log = max(num_batches // gradient_accumulation_steps, 1) if num_batches > 0 else 1
+                
                 if hasattr(bert_model, '_mlm_loss_accumulator') and bert_model._mlm_loss_accumulator:
-                    avg_mlm_loss = sum(bert_model._mlm_loss_accumulator) / len(bert_model._mlm_loss_accumulator)
+                    # Normalize each loss by gradient_accumulation_steps (matching Trainer's training_step normalization)
+                    normalized_losses = [loss / gradient_accumulation_steps for loss in bert_model._mlm_loss_accumulator]
+                    # Sum normalized losses (matching Trainer's tr_loss accumulation)
+                    sum_mlm_loss = sum(normalized_losses)
+                    # Divide by steps since last log (matching Trainer's behavior exactly)
+                    # This matches: logs["loss"] = tr_loss_scalar / (self.state.global_step - self._globalstep_last_logged)
+                    avg_mlm_loss = sum_mlm_loss / steps_since_last_log if steps_since_last_log > 0 else sum_mlm_loss
                     loss_logs[f"{prefix}mlm_loss"] = avg_mlm_loss
                 
-                # Compute average Data2Vec loss from accumulator (across batches in gradient accumulation)
+                # Sum Data2Vec losses from accumulator (matching Trainer's behavior)
                 if hasattr(bert_model, '_d2v_loss_accumulator') and bert_model._d2v_loss_accumulator:
-                    avg_d2v_loss = sum(bert_model._d2v_loss_accumulator) / len(bert_model._d2v_loss_accumulator)
+                    # Normalize each loss by gradient_accumulation_steps
+                    normalized_losses = [loss / gradient_accumulation_steps for loss in bert_model._d2v_loss_accumulator]
+                    sum_d2v_loss = sum(normalized_losses)
+                    # Divide by steps since last log (matching Trainer's behavior exactly)
+                    avg_d2v_loss = sum_d2v_loss / steps_since_last_log if steps_since_last_log > 0 else sum_d2v_loss
                     loss_logs[f"{prefix}data2vec_loss"] = avg_d2v_loss
 
                 if loss_logs:

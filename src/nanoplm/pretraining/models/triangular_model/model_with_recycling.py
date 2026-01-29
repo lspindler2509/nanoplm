@@ -447,7 +447,8 @@ class ModernBertForMaskedLMWithRecycling(ModernBertPreTrainedModel):
         # Store separate losses in self for logging (only if Data2Vec is enabled and labels provided)
         # Note: We can't add them to MaskedLMOutput as it's a dataclass, so we store them in the model instance
         # Accumulate losses across batches (for gradient accumulation) - similar to RecyclingMetricsCallback
-        if self.model.use_data2vec and labels is not None:
+        # IMPORTANT: Only accumulate during training, not during evaluation
+        if self.model.use_data2vec and labels is not None and self.training:
             # Initialize accumulators if they don't exist
             if not hasattr(self, '_mlm_loss_accumulator'):
                 self._mlm_loss_accumulator = []
