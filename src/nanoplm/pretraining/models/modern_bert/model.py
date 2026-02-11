@@ -50,6 +50,7 @@ class ProtModernBertMLMConfig:
     data2vec_loss_scale: Optional[float] = -1.0  # Loss scale (-1.0 = auto = 1/sqrt(hidden_size) as in fairseq, >0 = explicit scale)
     data2vec_layer_norm_targets: Optional[bool] = False  # Apply layer norm to teacher targets (improves stability)
     data2vec_instance_norm_targets: Optional[bool] = False  # Apply instance norm to teacher targets (improves stability)
+    ema_transformer_layers_only: Optional[bool] = False  # If True, share embeddings & embed norm (copy from student); only transformer layers get EMA (like Fairseq)
 
 class ProtModernBertMLM(nn.Module):
     """

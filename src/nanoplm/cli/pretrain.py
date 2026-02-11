@@ -689,6 +689,7 @@ def _load_model_config(config: Dict[str, Any]) -> ProtModernBertMLMConfig:
         'data2vec_loss_scale',
         'data2vec_layer_norm_targets',
         'data2vec_instance_norm_targets',
+        'ema_transformer_layers_only',
         'recycling_mode',
     }
     
