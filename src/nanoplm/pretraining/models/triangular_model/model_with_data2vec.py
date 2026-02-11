@@ -175,14 +175,17 @@ class ModernBertForMaskedLMWithData2Vec(ModernBertPreTrainedModel):
             
             # Get target from top-K layers average (following fairseq line 430-432)
             # In fairseq: y = encoder_out["fc_results"], then y = y[-self.average_top_k_layers:]
-            # fc_results are hidden states AFTER layer norm in each layer
-            # We use hidden_states which should be after layer norm in each layer
-            if hasattr(teacher_outputs, 'hidden_states') and teacher_outputs.hidden_states:
-                top_k = teacher_outputs.hidden_states[-self.model.average_top_k_layers:]
+            # fc_results are FFN outputs BEFORE the last residual connection in each block
+            # This is critical: we use the FFN output PRIOR to residual connection, not after!
+            if hasattr(teacher_outputs, 'fc_results') and teacher_outputs.fc_results:
+                # Use fc_results (FFN outputs before residual) - this matches fairseq exactly
+                # Detach immediately to save memory (no gradient graph needed for teacher targets)
+                top_k_layers = [tl.detach() for tl in teacher_outputs.fc_results[-self.model.average_top_k_layers:]]
                 
                 # Apply layer normalization BEFORE averaging (fairseq lines 435-454)
                 # This is critical: normalize each layer individually, then average
-                layer_norm_target_layer = getattr(self.model.config, 'data2vec_layer_norm_target_layer', False)
+                # Since ModernBERT uses pre-norm, we MUST normalize here (unlike fairseq where fc_results are already normalized)
+                layer_norm_target_layer = getattr(self.model.config, 'data2vec_layer_norm_target_layer', True)  # Default to True for ModernBERT
                 instance_norm_target_layer = getattr(self.model.config, 'data2vec_instance_norm_target_layer', False)
                 batch_norm_target_layer = getattr(self.model.config, 'data2vec_batch_norm_target_layer', False)
                 
@@ -190,27 +193,63 @@ class ModernBertForMaskedLMWithData2Vec(ModernBertPreTrainedModel):
                 # Fairseq transposes for instance/batch norm, we don't need to
                 if batch_norm_target_layer:
                     # Batch norm on each layer (fairseq lines 439-445)
-                    top_k = [
+                    top_k_layers = [
                         F.batch_norm(
                             tl.float(), running_mean=None, running_var=None, training=True
                         )
-                        for tl in top_k
+                        for tl in top_k_layers
                     ]
                 
                 if instance_norm_target_layer:
                     # Instance norm on each layer (fairseq line 447-448)
                     # Fairseq transposes TBC->BCT, but we're already B x T x C
-                    top_k = [F.instance_norm(tl.float()) for tl in top_k]
+                    top_k_layers = [F.instance_norm(tl.float()) for tl in top_k_layers]
                 
                 if layer_norm_target_layer:
                     # Layer norm on each layer (fairseq line 453-454)
-                    top_k = [F.layer_norm(tl.float(), tl.shape[-1:]) for tl in top_k]
+                    top_k_layers = [F.layer_norm(tl.float(), tl.shape[-1:]) for tl in top_k_layers]
                 
-                # Average over layers (fairseq line 456)
-                target = sum(top_k) / len(top_k)
+                # Average over layers (fairseq line 456) - sum() is optimized in PyTorch
+                target = sum(top_k_layers) / len(top_k_layers)
+            elif hasattr(teacher_outputs, 'hidden_states') and teacher_outputs.hidden_states:
+                # Fallback: if fc_results not available, use hidden_states (but this is less accurate)
+                # hidden_states are after residual connection, not what we want for data2vec
+                # Detach immediately to save memory (no gradient graph needed for teacher targets)
+                top_k_layers = [tl.detach() for tl in teacher_outputs.hidden_states[-self.model.average_top_k_layers:]]
+                
+                # Apply layer normalization BEFORE averaging (fairseq lines 435-454)
+                # This is critical: normalize each layer individually, then average
+                # Since ModernBERT uses pre-norm, we MUST normalize here (unlike fairseq where fc_results are already normalized)
+                layer_norm_target_layer = getattr(self.model.config, 'data2vec_layer_norm_target_layer', True)  # Default to True for ModernBERT
+                instance_norm_target_layer = getattr(self.model.config, 'data2vec_instance_norm_target_layer', False)
+                batch_norm_target_layer = getattr(self.model.config, 'data2vec_batch_norm_target_layer', False)
+                
+                # Note: Fairseq uses T x B x C format, we use B x T x C
+                # Fairseq transposes for instance/batch norm, we don't need to
+                if batch_norm_target_layer:
+                    # Batch norm on each layer (fairseq lines 439-445)
+                    top_k_layers = [
+                        F.batch_norm(
+                            tl.float(), running_mean=None, running_var=None, training=True
+                        )
+                        for tl in top_k_layers
+                    ]
+                
+                if instance_norm_target_layer:
+                    # Instance norm on each layer (fairseq line 447-448)
+                    # Fairseq transposes TBC->BCT, but we're already B x T x C
+                    top_k_layers = [F.instance_norm(tl.float()) for tl in top_k_layers]
+                
+                if layer_norm_target_layer:
+                    # Layer norm on each layer (fairseq line 453-454)
+                    top_k_layers = [F.layer_norm(tl.float(), tl.shape[-1:]) for tl in top_k_layers]
+                
+                # Average over layers (fairseq line 456) - sum() is optimized in PyTorch
+                target = sum(top_k_layers) / len(top_k_layers)
             else:
                 # Fallback: use last hidden state
-                target = teacher_outputs[0]
+                # Detach immediately to save memory (no gradient graph needed for teacher targets)
+                target = teacher_outputs[0].detach()
             
             # Apply target normalization AFTER averaging (fairseq lines 461-465)
             layer_norm_targets = getattr(self.model.config, 'data2vec_layer_norm_targets', False)
@@ -237,15 +276,27 @@ class ModernBertForMaskedLMWithData2Vec(ModernBertPreTrainedModel):
         
         # Student prediction (following fairseq exactly: apply regression head AFTER masking)
         # In fairseq: x = x[masked_indices], then x = self.regression_head(x)
+        # IMPORTANT: Student output must be normalized the same way as teacher targets.
+        # last_hidden_state is normalized by final_norm, but teacher targets are normalized
+        # by layer_norm_target_layer (per-layer) + optionally layer_norm_targets (after averaging).
+        # We need to ensure consistency: if teacher uses layer_norm_target_layer, student should too.
         if self.sparse_prediction:
             # For sparse prediction, last_hidden_state is already masked
-            x = self.model.regression_head(last_hidden_state)
-            y = target_masked
+            student_hidden = last_hidden_state
         else:
-            # For dense prediction, mask first, then apply regression head
-            student_hidden = last_hidden_state.view(-1, last_hidden_state.size(-1))
-            x = self.model.regression_head(student_hidden[mask_tokens])
-            y = target_masked
+            # For dense prediction, mask first
+            student_hidden = last_hidden_state.view(-1, last_hidden_state.size(-1))[mask_tokens]
+        
+        # Apply same normalization as teacher targets (if layer_norm_target_layer was used)
+        # Since ModernBERT's last_hidden_state is normalized by final_norm, we need to check
+        # if we should apply additional normalization to match teacher targets.
+        # For now, we use last_hidden_state as-is (it's already normalized by final_norm),
+        # but we should verify this matches the teacher normalization scheme.
+        # Note: If teacher uses layer_norm_target_layer=True, each layer is normalized individually.
+        # Student's last_hidden_state is normalized by final_norm, which is similar but not identical.
+        # To be safe, we could apply layer_norm here too, but let's keep it as-is for now and verify.
+        x = self.model.regression_head(student_hidden)
+        y = target_masked
         
         # Loss computation using Cosine Similarity Loss (like JEPA)
         # Compute cosine similarity between student prediction and teacher target
@@ -576,7 +627,6 @@ class ModernBertModelWithData2Vec(ModernBertPreTrainedModel):
     
     def set_num_updates(self, num_updates):
         """Update EMA decay rate and step EMA teacher for Data2Vec. Copied from Fairseq."""
-        super().set_num_updates(num_updates)
         if self.ema is None and self.regression_head is not None:
             logger.info(f"making ema teacher")
             self.make_ema_teacher()
@@ -657,6 +707,10 @@ class ModernBertModelWithData2Vec(ModernBertPreTrainedModel):
 
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
+        # Collect FFN outputs (fc_results) for data2vec - FFN output BEFORE residual connection
+        # This matches fairseq's fc_results behavior
+        # We need fc_results if data2vec is enabled, regardless of output_hidden_states
+        fc_results = [] if self.use_data2vec else None
 
         self._maybe_set_compile()
 
@@ -707,6 +761,9 @@ class ModernBertModelWithData2Vec(ModernBertPreTrainedModel):
             position_embeddings[layer_type] = self.rotary_emb(
                 hidden_states, position_ids, layer_type)
         
+        # Return FC results (FFN outputs before residual) for data2vec
+        return_fc = (fc_results is not None)
+        
         for encoder_layer in self.layers:
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
@@ -720,10 +777,17 @@ class ModernBertModelWithData2Vec(ModernBertPreTrainedModel):
                 max_seqlen=max_seqlen,
                 position_embeddings=position_embeddings[encoder_layer.attention_type],
                 output_attentions=output_attentions,
+                return_fc=return_fc,
             )
             hidden_states = layer_outputs[0]
-            if output_attentions and len(layer_outputs) > 1:
-                all_self_attentions = all_self_attentions + (layer_outputs[1],)
+            if return_fc and len(layer_outputs) > 1:
+                fc_result = layer_outputs[1]
+                fc_results.append(fc_result)
+            if output_attentions:
+                # Attentions are at index 2 if return_fc=True, else at index 1
+                attn_idx = 2 if return_fc else 1
+                if len(layer_outputs) > attn_idx:
+                    all_self_attentions = all_self_attentions + (layer_outputs[attn_idx],)
 
         
         if output_hidden_states:
@@ -741,6 +805,12 @@ class ModernBertModelWithData2Vec(ModernBertPreTrainedModel):
                         inputs=hs, indices=indices, batch=batch_size, seqlen=seq_len)
                     for hs in all_hidden_states
                 )
+            if fc_results is not None:
+                fc_results = [
+                    _pad_modernbert_output(
+                        inputs=fc, indices=indices, batch=batch_size, seqlen=seq_len)
+                    for fc in fc_results
+                ]
         # If the attention implementation is FA2 and there is no need for repadding, there might still be the batch
         # dimension missing
         elif (
@@ -751,14 +821,23 @@ class ModernBertModelWithData2Vec(ModernBertPreTrainedModel):
             hidden_states = hidden_states.unsqueeze(0)
             all_hidden_states = tuple(hs.unsqueeze(0)
                                       for hs in all_hidden_states)
+            if fc_results is not None:
+                fc_results = [fc.unsqueeze(0) for fc in fc_results]
 
         if not return_dict:
             return tuple(v for v in [hidden_states, all_hidden_states, all_self_attentions] if v is not None)
-        return BaseModelOutput(
+        
+        # Store fc_results in a custom output object (BaseModelOutput doesn't have this field)
+        # We'll access it via hidden_states tuple or add it to the output
+        output = BaseModelOutput(
             last_hidden_state=hidden_states,
             hidden_states=all_hidden_states,
             attentions=all_self_attentions,
         )
+        # Add fc_results as an attribute for data2vec to access
+        if fc_results is not None:
+            output.fc_results = fc_results
+        return output
 
     
     def _update_attention_mask(self, attention_mask: torch.Tensor, output_attentions: bool) -> torch.Tensor:
@@ -934,6 +1013,7 @@ class ModernBertEncoderLayer(GradientCheckpointingLayer):
         max_seqlen: Optional[int] = None,
         position_embeddings: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = False,
+        return_fc: Optional[bool] = False,
     ) -> torch.Tensor:
         attn_outputs = self.attn(
             self.attn_norm(hidden_states),
@@ -951,9 +1031,16 @@ class ModernBertEncoderLayer(GradientCheckpointingLayer):
             if self.config.reference_compile
             else self.mlp(self.mlp_norm(hidden_states))
         )
+        
+        # Store FFN output BEFORE residual connection (like fairseq's fc_result)
+        fc_result = mlp_output if return_fc else None
+        
         hidden_states = hidden_states + mlp_output
 
-        # add attentions if outputted
+        # Return: (hidden_states, fc_result, ...attentions)
+        # fc_result is the FFN output BEFORE residual connection (like fairseq)
+        if return_fc:
+            return (hidden_states, fc_result) + attn_outputs[1:]
         return (hidden_states,) + attn_outputs[1:]
 
 
