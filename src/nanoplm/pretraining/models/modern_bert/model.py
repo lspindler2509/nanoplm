@@ -4,11 +4,53 @@ import torch
 import torch.nn as nn
 from transformers.modeling_outputs import MaskedLMOutput
 
+import torch.nn as nn
+import torch.nn.functional as F
 from transformers import ModernBertConfig, ModernBertForMaskedLM
 from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
 from nanoplm.pretraining.models.triangular_model.model_withTriangularAttention import ModernBertForMaskedLMWithTriangularAttention
 from nanoplm.pretraining.models.triangular_model.model_with_recycling import ModernBertForMaskedLMWithRecycling
 from nanoplm.pretraining.models.triangular_model.model_with_data2vec import ModernBertForMaskedLMWithData2Vec
+
+
+class SwiGLU(nn.Module):
+    def forward(self, x, gate):
+        return F.silu(gate) * x
+
+
+class ModernBertMLPSwiGLU(nn.Module):
+    """Replacement MLP that applies SwiGLU to each ModernBERT layer."""
+
+    def __init__(self, config: ModernBertConfig):
+        super().__init__()
+        self.Wi = nn.Linear(config.hidden_size, config.intermediate_size * 2, bias=config.mlp_bias)
+        self.drop = nn.Dropout(config.mlp_dropout)
+        self.act = SwiGLU()
+        self.Wo = nn.Linear(config.intermediate_size, config.hidden_size, bias=config.mlp_bias)
+
+    def forward(self, hidden_states):
+        x, gate = self.Wi(hidden_states).chunk(2, dim=-1)
+        return self.Wo(self.drop(self.act(x, gate)))
+
+
+class SwiGLU(nn.Module):
+    def forward(self, x, gate):
+        return F.silu(gate) * x
+
+
+class ModernBertMLPSwiGLU(nn.Module):
+    """Replacement MLP that applies SwiGLU to each ModernBERT layer."""
+
+    def __init__(self, config: ModernBertConfig):
+        super().__init__()
+        self.Wi = nn.Linear(config.hidden_size, config.intermediate_size * 2, bias=config.mlp_bias)
+        self.drop = nn.Dropout(config.mlp_dropout)
+        self.act = SwiGLU()
+        self.Wo = nn.Linear(config.intermediate_size, config.hidden_size, bias=config.mlp_bias)
+
+    def forward(self, hidden_states):
+        x, gate = self.Wi(hidden_states).chunk(2, dim=-1)
+        return self.Wo(self.drop(self.act(x, gate)))
 
 @dataclass
 class ProtModernBertMLMConfig:
@@ -129,9 +171,21 @@ class ProtModernBertMLM(nn.Module):
             bos_token_id=None,
             unk_token_id=self.tokenizer.unk_token_id,
             mask_token_id=self.tokenizer.mask_token_id,
+            loss_type="ForMaskedLM",,
             tie_word_embeddings=False,
-            #_attn_implementation="eager"
         )
+        
+        super().__init__(self.config)
+        # PreTrainedModel.__init__ auto-infers loss_type from class name via
+        # regex against LOSS_MAPPING keys. "ProtModernBertMLM" doesn't contain
+        # "ForMaskedLM", so it falls back to None → ForCausalLMLoss (which
+        # shifts labels left by 1 — wrong for MLM). Override it here.
+        self.loss_type = "ForMaskedLM"
+
+        # Apply SwiGLU activation to MLP layers if specified
+        if config.mlp_activation.lower() == "swiglu":
+            for layer in self.model.layers:
+                layer.mlp = ModernBertMLPSwiGLU(self.config)
 
         # Manueller Fix wenn layer_types null ist:
         if not hasattr(self.config, 'layer_types') or self.config.layer_types is None:
