@@ -171,7 +171,7 @@ class ProtModernBertMLM(nn.Module):
             bos_token_id=None,
             unk_token_id=self.tokenizer.unk_token_id,
             mask_token_id=self.tokenizer.mask_token_id,
-            loss_type="ForMaskedLM",,
+            loss_type="ForMaskedLM",
             tie_word_embeddings=False,
         )
         
