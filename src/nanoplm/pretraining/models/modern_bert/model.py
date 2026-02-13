@@ -174,13 +174,10 @@ class ProtModernBertMLM(nn.Module):
             loss_type="ForMaskedLM",
             tie_word_embeddings=False,
         )
-        
-        super().__init__(self.config)
-        # PreTrainedModel.__init__ auto-infers loss_type from class name via
-        # regex against LOSS_MAPPING keys. "ProtModernBertMLM" doesn't contain
-        # "ForMaskedLM", so it falls back to None → ForCausalLMLoss (which
-        # shifts labels left by 1 — wrong for MLM). Override it here.
-        self.loss_type = "ForMaskedLM"
+        # Build base model so we have self.model for SwiGLU replacement below.
+        # (We inherit from nn.Module, so we must not call super().__init__(self.config).)
+        _base = ModernBertForMaskedLM(self.config)
+        self.model = _base.model
 
         # Apply SwiGLU activation to MLP layers if specified
         if config.mlp_activation.lower() == "swiglu":
@@ -263,7 +260,7 @@ class ProtModernBertMLM(nn.Module):
             self.bert_model = ModernBertForMaskedLMWithData2Vec(self.config)
         else:
             print("🔧 Building STANDARD ModernBERT architecture")
-            self.bert_model = ModernBertForMaskedLM(self.config)  
+            self.bert_model = _base  
         print(self.config)
         
         # Print model parameter count
