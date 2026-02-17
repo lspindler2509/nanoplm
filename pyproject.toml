@@ -29,6 +29,7 @@ classifiers = [
 ]
 keywords = ["bioinformatics", "protein-language-model", "large-language-models"]
 dependencies = [
+    "dion @ git+https://github.com/microsoft/dion.git",
     "accelerate>=1.7.0",
     "biopython>=1.85",
     "click>=8.1.8",
@@ -44,6 +45,11 @@ dependencies = [
     "wandb>=0.19.11",
     "certifi>=2024.7.4",
     "ipython>=8.3.0",
+]
+
+[project.optional-dependencies]
+cuda = [
+    "dion @ git+https://github.com/microsoft/dion.git",
 ]
 
 [project.scripts]

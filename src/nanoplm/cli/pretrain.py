@@ -4,6 +4,11 @@ nanoPLM CLI - Pretraining subcommands for MLM pretraining
 """
 
 import click
+import random
+import math
+import os
+import numpy as np
+import torch
 from typing import Optional, Dict, Any, Union
 from pathlib import Path
 
@@ -12,9 +17,22 @@ from nanoplm.pretraining.pipeline import (
     ResumeConfig,
     run_pretraining,
 )
+from nanoplm.pretraining.pure_pipeline import run_pure_pretraining
 from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLM, ProtModernBertMLMConfig
+from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
 from nanoplm.utils.common import read_yaml, create_dirs, is_flash_attention_available
 from nanoplm.utils.logger import logger
+
+def _check_muon_available(optimizer: str) -> None:
+    """Abort early when a Muon variant is requested but ``dion`` is not installed."""
+    if optimizer.lower() in {"muon", "normuon"}:
+        try:
+            import dion  # noqa: F401
+        except ImportError:
+            raise click.ClickException(
+                f"Optimizer '{optimizer}' requires the 'dion' package which is not installed.\n"
+                "Install it with:  pip install nanoplm[cuda]"
+            )
 
 
 @click.group(name="pretrain")
@@ -47,10 +65,10 @@ def pretrain():
 )
 # Training hyperparameters
 @click.option(
-    "--batch-size",
+    "--micro-batch-size",
     type=int,
     default=32,
-    help="Per-device batch size"
+    help="Per-device micro-batch size (samples per GPU per forward pass)",
 )
 @click.option(
     "--num-epochs",
@@ -59,16 +77,16 @@ def pretrain():
     help="Number of epochs"
 )
 @click.option(
-    "--learning-rate",
+    "--adam-learning-rate",
     type=float,
     default=1e-3,
-    help="Maximum Learning rate in the warmup"
+    help="AdamW learning rate (Muon uses --muon-learning-rate)"
 )
 @click.option(
-    "--weight-decay",
+    "--adam-weight-decay",
     type=float,
     default=0.0,
-    help="Weight decay"
+    help="AdamW weight decay (Muon uses --muon-weight-decay)"
 )
 @click.option(
     "--max-grad-norm",
@@ -77,10 +95,16 @@ def pretrain():
     help="Maximum gradient norm for clipping"
 )
 @click.option(
-    "--warmup-ratio",
+    "--max-grad-norm",
+    type=float,
+    default=1.0,
+    help="Maximum gradient norm for clipping"
+)
+@click.option(
+    "--adam-warmup-ratio",
     type=float,
     default=0.05,
-    help="Warmup ratio (percentage of total steps). Ignored if --warmup-steps is set."
+    help="AdamW warmup ratio (percentage of total steps). Ignored if --warmup-steps is set."
 )
 @click.option(
     "--warmup-steps",
@@ -95,8 +119,14 @@ def pretrain():
     help="Learning rate scheduler type"
 )
 @click.option(
+    "--global-batch-size",
+    type=int,
+    default=2 ** 20,
+    help="Target tokens per optimizer step (grad_accum inferred automatically)",
+)
+@click.option(
     "--optimizer",
-    type=click.Choice(["adamw", "stable_adamw"], case_sensitive=False),
+    type=click.Choice(["adamw", "stable_adamw", "muon", "normuon"], case_sensitive=False),
     default="adamw",
     help="Optimizer to use"
 )
@@ -119,16 +149,49 @@ def pretrain():
     help="Adam epsilon"
 )
 @click.option(
+    "--muon-learning-rate",
+    type=float,
+    default=2e-2,
+    help="Muon LR (used only when optimizer=muon or normuon; learning-rate remains AdamW LR)",
+)
+@click.option(
+    "--muon-weight-decay",
+    type=float,
+    default=0.1,
+    help="Muon weight decay (used only when optimizer=muon or normuon)",
+)
+@click.option(
+    "--muon-cautious-weight-decay/--no-muon-cautious-weight-decay",
+    default=True,
+    help="Enable cautious weight decay in Muon/NorMuon (used only when optimizer=muon or normuon)",
+)
+@click.option(
+    "--muon-use-polar-express/--no-muon-use-polar-express",
+    default=False,
+    help="Use Polar Express orthogonalization for Muon/NorMuon (used only when optimizer=muon or normuon)",
+)
+@click.option(
+    "--muon-momentum",
+    type=float,
+    default=0.95,
+    help="Muon momentum (used only when optimizer=muon or normuon)",
+)
+@click.option(
+    "--muon-nesterov/--no-muon-nesterov",
+    default=True,
+    help="Enable Nesterov in Muon (used only when optimizer=muon or normuon)",
+)
+@click.option(
+    "--muon-eps",
+    type=float,
+    default=1e-7,
+    help="Muon epsilon (used only when optimizer=muon or normuon)",
+)
+@click.option(
     "--mlm-probability",
     type=float,
     default=0.3,
     help="MLM probability"
-)
-@click.option(
-    "--gradient-accumulation-steps",
-    type=int,
-    default=1,
-    help="Gradient accumulation steps",
 )
 @click.option(
     "--logging-steps",
@@ -183,6 +246,19 @@ def pretrain():
     type=int,
     default=2,
     help="DataLoader prefetch factor"
+)
+@click.option(
+    "--use-packing/--no-packing",
+    default=False,
+    help="Enable sequence packing to eliminate padding waste (requires flash attention)"
+)
+@click.option(
+    "--target-packed-rows",
+    type=int,
+    default=None,
+    help="Fixed row count for static-shape compilation (enables dynamic=False). "
+         "Set to ceil(micro_batch_size * avg_len / max_seq_len) + margin. "
+         "Omit to use dynamic=True."
 )
 @click.option(
     "--bf16/--no-bf16",
@@ -279,25 +355,38 @@ def pretrain():
     default="gelu",
     help="Classifier activation",
 )
+@click.option(
+    "--pure-torch",
+    is_flag=True,
+    default=False,
+    help="Use custom pure-torch model and training loop instead of HF Trainer",
+)
 def run(
     # dataset/output
     dataset_dir: str,
     ckp_dir: str,
     # training hp
-    batch_size: int,
+    micro_batch_size: int,
     num_epochs: int,
-    learning_rate: float,
-    weight_decay: float,
+    adam_learning_rate: float,
+    adam_weight_decay: float,
     max_grad_norm: float,
     warmup_ratio: float,
+    global_batch_size: int,
     warmup_steps: Optional[int],
     lr_scheduler_type: str,
     optimizer: str,
     adam_beta1: float,
     adam_beta2: float,
     adam_epsilon: float,
+    muon_learning_rate: float,
+    muon_weight_decay: float,
+    muon_cautious_weight_decay: bool,
+    muon_use_polar_express: bool,
+    muon_momentum: float,
+    muon_nesterov: bool,
+    muon_eps: float,
     mlm_probability: float,
-    gradient_accumulation_steps: int,
     logging_steps: int,
     eval_steps: int,
     save_steps: int,
@@ -307,6 +396,8 @@ def run(
     keep_probability: float,
     num_workers: Union[int, str],
     prefetch_factor: int,
+    use_packing: bool,
+    target_packed_rows: Optional[int],
     bf16: bool,
     tf32: bool,
     multi_gpu: bool,
@@ -324,27 +415,37 @@ def run(
     attention_bias: bool,
     attention_dropout: float,
     classifier_activation: str,
+    pure_torch: bool,
 ):
     """Run MLM pretraining with ModernBERT backbone."""
+
+    _check_muon_available(optimizer)
 
     # Build config from CLI arguments
     cfg = PretrainingConfig(
         dataset_dir=dataset_dir,
         ckp_dir=ckp_dir,
-        batch_size=batch_size,
+        micro_batch_size=micro_batch_size,
         num_epochs=num_epochs,
-        learning_rate=learning_rate,
-        weight_decay=weight_decay,
+        adam_learning_rate=adam_learning_rate,
+        adam_weight_decay=adam_weight_decay,
         max_grad_norm=max_grad_norm,
         warmup_ratio=warmup_ratio,
+        global_batch_size=global_batch_size,
         warmup_steps=warmup_steps,
         lr_scheduler_type=lr_scheduler_type,
         optimizer=optimizer,
         adam_beta1=adam_beta1,
         adam_beta2=adam_beta2,
         adam_epsilon=adam_epsilon,
+        muon_learning_rate=muon_learning_rate,
+        muon_weight_decay=muon_weight_decay,
+        muon_cautious_weight_decay=muon_cautious_weight_decay,
+        muon_use_polar_express=muon_use_polar_express,
+        muon_momentum=muon_momentum,
+        muon_nesterov=muon_nesterov,
+        muon_eps=muon_eps,
         mlm_probability=mlm_probability,
-        gradient_accumulation_steps=gradient_accumulation_steps,
         mask_replace_prob=mask_replace_prob,
         random_token_prob=random_token_prob,
         keep_probability=keep_probability,
@@ -354,13 +455,15 @@ def run(
         seed=seed,
         num_workers=num_workers,
         prefetch_factor=prefetch_factor,
+        use_packing=use_packing,
+        target_packed_rows=target_packed_rows,
         bf16=bf16,
         tf32=tf32,
         multi_gpu=multi_gpu,
         world_size=world_size,
         project_name=project_name,
     )
-    
+
     model_cfg = ProtModernBertMLMConfig(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
@@ -375,14 +478,23 @@ def run(
         classifier_activation=classifier_activation,
     )
 
-    model = ProtModernBertMLM(model_cfg)
+    if pure_torch:
+        logger.info("Using pure-torch model and training loop")
+        _set_seed_for_init(seed)
+        model = PureProtModernBertMLM(model_cfg)
+    else:
+        _set_seed_for_init(seed)
+        model = ProtModernBertMLM(model_cfg)
 
     model_parameters = filter(lambda p: p.requires_grad, model.parameters())
     total_params = sum(p.numel() for p in model_parameters)
     logger.info(f"Total Trainable Parameters: {total_params}")
     logger.info(f"Flash attention available: {is_flash_attention_available()}")
 
-    run_pretraining(model=model, pretrain_config=cfg)
+    if pure_torch:
+        run_pure_pretraining(model=model, pretrain_config=cfg)
+    else:
+        run_pretraining(model=model, pretrain_config=cfg)
 
 
 @pretrain.command("from-yaml")
@@ -395,7 +507,13 @@ def run(
     default="pretrain.yaml",
     type=click.Path(exists=True, dir_okay=False, readable=True),
 )
-def from_yaml(config: str):
+@click.option(
+    "--pure-torch",
+    is_flag=True,
+    default=False,
+    help="Use custom pure-torch model and training loop instead of HF Trainer",
+)
+def from_yaml(config: str, pure_torch: bool):
     """Run pretraining from a YAML file with training and model parameters.
 
     Expected YAML structure:
@@ -422,23 +540,41 @@ def from_yaml(config: str):
     model_dict = raw.get("model")
     resume_dict = raw.get("resume")
 
+    # Support pure_torch from YAML or CLI flag (CLI flag takes precedence)
+    if not pure_torch:
+        pure_torch = bool(raw.get("pure_torch", False))
+
     # validate and load config
     pretrain_config = _load_pretrain_config(pretrain_dict)
+    _check_muon_available(pretrain_config.optimizer)
     model_config = _load_model_config(model_dict)
     resume_config = _load_resume_config(resume_dict)
 
-    model = ProtModernBertMLM(config=model_config)
+    if pure_torch:
+        logger.info("Using pure-torch model and training loop")
+        _set_seed_for_init(pretrain_config.seed)
+        model = PureProtModernBertMLM(config=model_config)
+    else:
+        _set_seed_for_init(pretrain_config.seed)
+        model = ProtModernBertMLM(config=model_config)
 
     model_parameters = filter(lambda p: p.requires_grad, model.parameters())
     total_params = sum(p.numel() for p in model_parameters)
     logger.info(f"Total Trainable Parameters: {total_params}")
     logger.info(f"Flash attention available: {is_flash_attention_available()}")
-        
-    run_pretraining(
-        model=model,
-        pretrain_config=pretrain_config,
-        resume_config=resume_config if resume_config.is_resume else None,
-    )
+
+    if pure_torch:
+        run_pure_pretraining(
+            model=model,
+            pretrain_config=pretrain_config,
+            resume_config=resume_config if resume_config.is_resume else None,
+        )
+    else:
+        run_pretraining(
+            model=model,
+            pretrain_config=pretrain_config,
+            resume_config=resume_config if resume_config.is_resume else None,
+        )
 
 
 @pretrain.command("get-yaml")
@@ -487,7 +623,7 @@ def get_yaml(output: Optional[str], force: bool):
         "# IMPORTANT: Before running pretraining, ensure you have prepared your data with:\n"
         "#   1. Set pipeline_mode: 'pretrain' in params.yaml\n"
         "#   2. Run: nanoplm data from-yaml\n"
-        "# This will generate the HDF5 shards and a .data_manifest file.\n"
+        "# This will generate binary shards and a .data_manifest file.\n"
         "\n"
         "model:\n"
         "  hidden_size: 1024\n"
@@ -511,30 +647,50 @@ def get_yaml(output: Optional[str], force: bool):
         "  ckp_dir: \"output/pretraining_checkpoints\"\n"
         "\n"
         "  # Hyperparameters\n"
-        "  batch_size: 32\n"
+        "  #   micro_batch_size: samples per GPU per forward pass (limited by GPU memory)\n"
+        "  #   global_batch_size: total tokens per optimizer step across all GPUs\n"
+        "  #   gradient_accumulation_steps is inferred automatically:\n"
+        "  #     grad_accum = ceil(global_batch_size / (micro_batch_size * max_seq_len * num_gpus))\n"
+        "  micro_batch_size: 32\n"
+        "  global_batch_size: 1048576  # 2^20 ≈ 1M tokens/step (based on PLM best practices)\n"
         "  num_epochs: 10\n"
+        "  warmup_ratio: 0.05\n"
         "\n"
-        "  optimizer: \"adamw\"  # adamw, stable_adamw\n"
+        "  optimizer: \"normuon\"  # adamw, stable_adamw, muon, normuon\n"
+        "  # AdamW hyperparameters (also used for AdamW side [1D and embedding/unembed params] when optimizer=muon or normuon)\n"
+        "  adam_learning_rate: 1e-3\n"
+        "  adam_weight_decay: 0.0\n"
         "  adam_beta1: 0.9\n"
         "  adam_beta2: 0.999\n"
         "  adam_epsilon: 1e-8\n"
-        "  learning_rate: 1e-3  # Maximum learning rate in warmup phase\n"
-        "  warmup_ratio: 0.05  # Percentage of total steps (ignored if warmup_steps is set)\n"
+        "  # Muon/NorMuon hyperparameters (used only when optimizer: muon or normuon)\n"
+        "  muon_learning_rate: 1e-3\n"
+        "  muon_weight_decay: 0.01  # Percentage of total steps (ignored if warmup_steps is set)\n"
         "  # warmup_steps: 200  # Optional: Absolute number of warmup steps (takes priority over warmup_ratio)\n"
         "  lr_scheduler_type: \"linear\"  # Options: linear, cosine, cosine_with_restarts, polynomial, constant, constant_with_warmup\n"
-        "  weight_decay: 0.0\n"
+        "  muon_cautious_weight_decay: true\n"
         "  max_grad_norm: 1.0  # Gradient clipping for stability\n"
-        "  gradient_accumulation_steps: 1\n"
+        "  muon_use_polar_express: false\n"
+        "  muon_momentum: 0.95\n"
+        "  muon_nesterov: true\n"
+        "  muon_eps: 1e-7\n"
+        "\n"
         "  mlm_probability: 0.3\n"
         "  mask_replace_prob: 0.8\n"
         "  random_token_prob: 0.1\n"
         "  keep_probability: 0.1\n"
-        "  logging_steps: 10\n"
-        "  eval_steps: 50\n"
-        "  save_steps: 100\n"
+        "  logging_steps: 1\n"
+        "  eval_steps: 250\n"
+        "  save_steps: 5000\n"
         "  seed: 42\n"
         "  num_workers: \"auto\"\n"
         "  prefetch_factor: 2\n"
+        "  # Sequence packing: concatenates shorter sequences into fewer rows to eliminate\n"
+        "  # padding waste and increase GPU utilization. Requires flash attention and --pure-torch\n"
+        "  use_packing: false\n"
+        "  # Fixed row count for static-shape compilation when use_packing is true (enables torch.compile dynamic=False).\n"
+        "  # Set to ceil(micro_batch_size * avg_len / max_seq_len) + margin. Leave null for dynamic=True.\n"
+        "  target_packed_rows: null\n"
         "\n"
         "  # Mixed precision training (recommended: keep enabled for 1.5-3x speedup)\n"
         "  # When bf16 is true, automatically selects the best precision for your hardware:\n"
@@ -557,6 +713,10 @@ def get_yaml(output: Optional[str], force: bool):
         "  is_resume: false\n"
         "  checkpoint_dir: \"output/pretraining_checkpoints/run-1/checkpoint-1\"\n"
         "  extra_epochs: 0\n"
+        "\n"
+        "# Set pure_torch: true to use the custom pure-torch model and training loop\n"
+        "# instead of HF Trainer. CLI equivalent: --pure-torch\n"
+        "# pure_torch: false\n"
         "  # normal_resume: if True, perform a normal Trainer resume (do not manually load weights)\n"
         "  # Set to True when you want to resume training exactly (optimizer/scheduler state restored)\n"
         "  normal_resume: True\n"
@@ -573,14 +733,53 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
     if config is None:
         raise ValueError("Pretraining configuration is required but not found in YAML")
 
+    normalized_config = dict(config)
+    legacy_aliases = {
+        "learning_rate": "adam_learning_rate",
+        "weight_decay": "adam_weight_decay",
+    }
+    for legacy_key, canonical_key in legacy_aliases.items():
+        if legacy_key not in normalized_config:
+            continue
+
+        legacy_value = normalized_config.get(legacy_key)
+        canonical_value = normalized_config.get(canonical_key)
+
+        if canonical_value is not None and legacy_value is not None:
+            same_value = legacy_value == canonical_value
+            if not same_value:
+                try:
+                    same_value = float(legacy_value) == float(canonical_value)
+                except (TypeError, ValueError):
+                    same_value = False
+            if not same_value:
+                logger.warning(
+                    f"Both '{legacy_key}' and '{canonical_key}' are set with different values. "
+                    f"Using '{canonical_key}' and ignoring '{legacy_key}'."
+                )
+        elif canonical_value is None and legacy_value is not None:
+            normalized_config[canonical_key] = legacy_value
+            logger.warning(
+                f"Deprecated key '{legacy_key}' detected; please use '{canonical_key}' instead."
+            )
+
+        normalized_config.pop(legacy_key, None)
+
     expected_keys = set(PretrainingConfig.__annotations__.keys())
-    present_keys = set(config.keys())
+    present_keys = set(normalized_config.keys())
 
     extra = []
     kwargs: Dict[str, Any] = {}
 
+    if "gradient_accumulation_steps" in present_keys:
+        raise ValueError(
+            "gradient_accumulation_steps is inferred automatically from "
+            "global_batch_size, micro_batch_size, max_seq_len, and world_size. "
+            "Remove gradient_accumulation_steps from your pretraining config."
+        )
+
     # Required key
-    if 'dataset_dir' not in config or not config['dataset_dir']:
+    if 'dataset_dir' not in normalized_config or not normalized_config['dataset_dir']:
         raise ValueError("dataset_dir is required in pretraining configuration")
 
     # Classify provided keys in one pass
@@ -588,7 +787,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         if key not in expected_keys:
             extra.append(key)
             continue
-        value = config.get(key)
+        value = normalized_config.get(key)
         if value is not None:
             kwargs[key] = value
 
@@ -597,21 +796,49 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
             f"Unexpected training configuration keys: {', '.join(sorted(extra))}"
         )
 
-    # Explicitly convert learning_rate to float if it's a string (handles scientific notation)
-    if isinstance(kwargs.get('learning_rate'), str):
-        try:
-            kwargs['learning_rate'] = float(kwargs['learning_rate'])
-        except ValueError:
-            raise ValueError(f"Invalid learning_rate value: {kwargs['learning_rate']}. Must be a number.")
+    # Explicitly convert float-like fields if they are strings (handles scientific notation).
+    float_fields = [
+        "adam_learning_rate",
+        "adam_weight_decay",
+        "adam_beta1",
+        "adam_beta2",
+        "adam_epsilon",
+        "muon_learning_rate",
+        "muon_weight_decay",
+        "muon_momentum",
+        "muon_eps",
+        "warmup_ratio",
+    ]
+    for field in float_fields:
+        if isinstance(kwargs.get(field), str):
+            try:
+                kwargs[field] = float(kwargs[field])
+            except ValueError as exc:
+                raise ValueError(f"Invalid {field} value: {kwargs[field]}. Must be a number.") from exc
 
     # Handle boolean values
-    for bool_key in ['multi_gpu', 'bf16', 'tf32']:
+    for bool_key in [
+        'multi_gpu',
+        'bf16',
+        'tf32',
+        'muon_nesterov',
+        'muon_cautious_weight_decay',
+        'muon_use_polar_express',
+        'use_packing',
+    ]:
         if bool_key in kwargs:
             value = kwargs[bool_key]
             if isinstance(value, bool):
                 continue
             elif isinstance(value, str):
                 kwargs[bool_key] = value.lower() == 'true'
+
+    # Handle optional int fields (may come as string from CLI overrides)
+    for int_key in ['target_packed_rows']:
+        if int_key in kwargs:
+            value = kwargs[int_key]
+            if isinstance(value, str):
+                kwargs[int_key] = int(value)
 
     return PretrainingConfig(**kwargs)
 
@@ -735,3 +962,11 @@ def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
             )
 
     return ResumeConfig(**kwargs)
+
+def _set_seed_for_init(seed: int) -> None:
+    """Set seed before model creation so both pipelines start with identical weights."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
