@@ -174,14 +174,15 @@ class ProtModernBertMLM(nn.Module):
             loss_type="ForMaskedLM",
             tie_word_embeddings=False,
         )
-        # Build base model so we have self.model for SwiGLU replacement below.
-        # (We inherit from nn.Module, so we must not call super().__init__(self.config).)
+        # Build base model for SwiGLU replacement. Do not assign _base.model to self.model,
+        # otherwise the same parameters appear under both model.* and bert_model.model.* in the
+        # state dict (shared tensors / duplicate memory on save).
         _base = ModernBertForMaskedLM(self.config)
-        self.model = _base.model
+        _model = _base.model
 
         # Apply SwiGLU activation to MLP layers if specified
         if config.mlp_activation.lower() == "swiglu":
-            for layer in self.model.layers:
+            for layer in _model.layers:
                 layer.mlp = ModernBertMLPSwiGLU(self.config)
 
         # Manueller Fix wenn layer_types null ist:
