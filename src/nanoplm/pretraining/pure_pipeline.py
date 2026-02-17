@@ -639,7 +639,11 @@ def run_pure_pretraining(
         grad_accum=inferred_grad_accum_steps,
     )
     total_steps = num_epochs * steps_per_epoch
-    warmup_steps = _get_warmup_steps(total_steps, float(pretrain_config.warmup_ratio))
+    # warmup_steps takes priority over warmup_ratio (same as HF Trainer path)
+    if getattr(pretrain_config, "warmup_steps", None) is not None:
+        warmup_steps = int(pretrain_config.warmup_steps)
+    else:
+        warmup_steps = _get_warmup_steps(total_steps, float(pretrain_config.warmup_ratio))
     scheduler = _create_scheduler(optimizer, warmup_steps, total_steps)
 
     start_step = 0
