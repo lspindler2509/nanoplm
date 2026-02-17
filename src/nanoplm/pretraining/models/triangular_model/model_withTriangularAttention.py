@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from typing import Optional, Union, Tuple, List
-from transformers import ModernBertConfig, ModernBertPreTrainedModel, ModernBertForMaskedLM
+from transformers import ModernBertConfig, ModernBertPreTrainedModel
 from transformers.modeling_outputs import BaseModelOutput
 from transformers.utils import logging
 from nanoplm.pretraining.models.modern_bert.activations import ACT2FN
@@ -73,7 +73,7 @@ class ModernBertForMaskedLMWithTriangularAttention(ModernBertPreTrainedModel):
             init_weight(module.Wo, stds["out"])
         elif isinstance(module, ModernBertPredictionHead):
             init_weight(module.dense, stds["out"])
-        elif isinstance(module, ModernBertForMaskedLM) or isinstance(module, ModernBertForMaskedLMWithTriangularAttention):
+        elif isinstance(module, ModernBertForMaskedLMWithTriangularAttention):
             init_weight(module.decoder, stds["out"])
         elif isinstance(module, nn.LayerNorm):
             module.weight.data.fill_(1.0)
@@ -272,7 +272,7 @@ class ModernBertModelWithTriangularAttention(ModernBertPreTrainedModel):
             init_weight(module.Wo, stds["out"])
         elif isinstance(module, ModernBertPredictionHead):
             init_weight(module.dense, stds["out"])
-        elif isinstance(module, ModernBertForMaskedLM) or isinstance(module, ModernBertForMaskedLMWithTriangularAttention):
+        elif isinstance(module, ModernBertForMaskedLMWithTriangularAttention):
             init_weight(module.decoder, stds["out"])
         elif isinstance(module, nn.LayerNorm):
             module.weight.data.fill_(1.0)

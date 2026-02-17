@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from typing import Optional, Union
-from transformers import ModernBertConfig, ModernBertPreTrainedModel, ModernBertForMaskedLM
+from transformers import ModernBertConfig, ModernBertPreTrainedModel
 from transformers.modeling_outputs import BaseModelOutput
 from transformers.utils import logging
 from nanoplm.pretraining.models.modern_bert.activations import ACT2FN
@@ -87,7 +87,7 @@ class ModernBertForMaskedLMWithData2Vec(ModernBertPreTrainedModel):
             init_weight(module.Wo, stds["out"])
         elif isinstance(module, ModernBertPredictionHead):
             init_weight(module.dense, stds["out"])
-        elif isinstance(module, ModernBertForMaskedLM) or isinstance(module, ModernBertForMaskedLMWithData2Vec):
+        elif isinstance(module, ModernBertForMaskedLMWithData2Vec):
             init_weight(module.decoder, stds["out"])
         elif isinstance(module, nn.LayerNorm):
             module.weight.data.fill_(1.0)
@@ -578,7 +578,7 @@ class ModernBertModelWithData2Vec(ModernBertPreTrainedModel):
             init_weight(module.Wo, stds["out"])
         elif isinstance(module, ModernBertPredictionHead):
             init_weight(module.dense, stds["out"])
-        elif isinstance(module, ModernBertForMaskedLM) or isinstance(module, ModernBertForMaskedLMWithData2Vec):
+        elif isinstance(module, ModernBertForMaskedLMWithData2Vec):
             init_weight(module.decoder, stds["out"])
         elif isinstance(module, nn.Linear) and hasattr(module, '_is_regression_head') and module._is_regression_head:
             # Regression head for Data2Vec: initialize with larger std for better initial predictions
