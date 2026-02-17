@@ -11,6 +11,7 @@ from pathlib import Path
 
 from safetensors.torch import load_file
 from transformers import (
+    Trainer,
     TrainingArguments,
 )
 from nanoplm.pretraining.trainer import PretrainingTrainer
