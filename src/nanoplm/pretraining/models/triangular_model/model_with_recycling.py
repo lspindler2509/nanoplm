@@ -7,6 +7,7 @@ from nanoplm.pretraining.models.modern_bert.activations import ACT2FN
 from transformers.modeling_outputs import MaskedLMOutput
 from nanoplm.utils import EMAModule, EMAModuleConfig
 import torch.nn.functional as F
+from transformers.utils import logging
 import math
 import re
 from contextlib import nullcontext
