@@ -329,7 +329,8 @@ class ModernBertForMaskedLMWithRecycling(ModernBertPreTrainedModel):
             Sequence length of the input sequences including padding tokens. Used to pad the output tensors.
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        self._maybe_set_compile()
+        if hasattr(self, "_maybe_set_compile"):
+            self._maybe_set_compile()
 
         if self.config._attn_implementation == "flash_attention_2":
             if indices is None and cu_seqlens is None and max_seqlen is None:
@@ -764,7 +765,8 @@ class ModernBertModelWithRecycling(ModernBertPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
 
-        self._maybe_set_compile()
+        if hasattr(self, "_maybe_set_compile"):
+            self._maybe_set_compile()
 
         if input_ids is not None:
             self.warn_if_padding_and_no_attention_mask(
