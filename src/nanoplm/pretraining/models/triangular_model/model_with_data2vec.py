@@ -413,26 +413,35 @@ class ModernBertForMaskedLMWithData2Vec(ModernBertPreTrainedModel):
             loss = mlm_loss
             d2v_loss = None
             
-            # Data2Vec Loss (if enabled)
+            # Data2Vec Loss (if enabled). Loss dropout: per batch, with probability data2vec_loss_dropout
+            # we skip the teacher forward and data2vec loss to save time (50:50 by default).
             if self.model.use_data2vec and self.model.ema is not None:
-                d2v_loss = self._compute_data2vec_loss(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    sliding_window_mask=sliding_window_mask,
-                    position_ids=position_ids,
-                    inputs_embeds=inputs_embeds,
-                    indices=indices,
-                    cu_seqlens=cu_seqlens,
-                    max_seqlen=max_seqlen,
-                    batch_size=batch_size,
-                    seq_len=seq_len,
-                    labels=labels,
-                    last_hidden_state=last_hidden_state,
-                )
-                if d2v_loss is not None:
-                    # Combine losses (weighted)
-                    d2v_weight = getattr(self.config, 'data2vec_loss_weight', 2.0)
-                    loss = loss + d2v_weight * d2v_loss
+                do_data2vec = True
+                if self.training:
+                    dropout = getattr(self.config, 'data2vec_loss_dropout', 0.0)
+                    if dropout > 0:
+                        do_data2vec = torch.rand(1, device=next(self.parameters()).device).item() >= dropout
+                if do_data2vec:
+                    d2v_loss = self._compute_data2vec_loss(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        sliding_window_mask=sliding_window_mask,
+                        position_ids=position_ids,
+                        inputs_embeds=inputs_embeds,
+                        indices=indices,
+                        cu_seqlens=cu_seqlens,
+                        max_seqlen=max_seqlen,
+                        batch_size=batch_size,
+                        seq_len=seq_len,
+                        labels=labels,
+                        last_hidden_state=last_hidden_state,
+                    )
+                    if d2v_loss is not None:
+                        # Combine losses (weighted)
+                        d2v_weight = getattr(self.config, 'data2vec_loss_weight', 2.0)
+                        loss = loss + d2v_weight * d2v_loss
+                else:
+                    d2v_loss = None
 
         if self.config._attn_implementation == "flash_attention_2":
             # Logits padding
