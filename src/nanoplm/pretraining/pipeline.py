@@ -263,7 +263,6 @@ class PretrainingConfig:
     world_size: Union[int, str] = 1
     project_name: str = "nanoplm-pretraining"
     bf16: bool = False
-    save_safetensors:  bool = True
 
 
 @dataclass
