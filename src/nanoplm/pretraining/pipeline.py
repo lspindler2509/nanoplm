@@ -439,7 +439,6 @@ def run_pretraining(
         "dataloader_num_workers": num_workers,
         "dataloader_persistent_workers": False,
         "bf16": pretrain_config.bf16,
-        "save_safetensors": pretrain_config.save_safetensors,
     }
 
     if num_workers > 0:
