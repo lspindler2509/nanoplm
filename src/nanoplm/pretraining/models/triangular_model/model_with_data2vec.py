@@ -469,7 +469,19 @@ class ModernBertForMaskedLMWithData2Vec(ModernBertPreTrainedModel):
         # Student prediction. Data2Vec 2.0: with CNN decoder we pass full (B,T,C) + mask; else mask first then MLP.
         if getattr(self.model, 'use_cnn_decoder', False) and not self.sparse_prediction:
             # Full sequence -> CNN (along time) -> take masked positions -> MLP
-            x = self.model.regression_head(last_hidden_state, mask_tokens)
+            # When using Flash Attention / packed input, last_hidden_state can be 2D (total_tokens, C); repad to (B, T, C)
+            student_hidden_3d = last_hidden_state
+            mask_for_head = mask_tokens
+            if student_hidden_3d.dim() == 2 and indices is not None and batch_size is not None and seq_len is not None:
+                student_hidden_3d = _pad_modernbert_output(
+                    inputs=student_hidden_3d, indices=indices, batch=batch_size, seqlen=seq_len
+                )
+                # mask_tokens is (total_tokens,); regression head indexes flattened (B*T, C) so need (B*T,) mask
+                mask_for_head = torch.zeros(
+                    batch_size * seq_len, dtype=torch.bool, device=mask_tokens.device
+                )
+                mask_for_head[indices] = mask_tokens
+            x = self.model.regression_head(student_hidden_3d, mask_for_head)
         else:
             if self.sparse_prediction:
                 student_hidden = last_hidden_state
