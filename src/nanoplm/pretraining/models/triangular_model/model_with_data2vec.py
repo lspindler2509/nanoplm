@@ -134,15 +134,16 @@ class Decoder1d(DecoderBase):
             self.proj = nn.Sequential(*projs)
 
     def forward(self, x: torch.Tensor, mask_info: Optional[object] = None) -> torch.Tensor:
+        dtype = x.dtype
         x = x.transpose(1, 2)
         residual = x
         for i, layer in enumerate(self.blocks):
-            x = layer(x)
+            x = layer(x).to(dtype)  # LayerNorm etc. can return float32; keep bfloat16
             x = self.add_residual(x, residual, i, mask_info)
             residual = x
-        x = x.transpose(1, 2)
+        x = x.transpose(1, 2).to(dtype)
         x = self.proj(x)
-        return x
+        return x.to(dtype)
 
 
 # --- Wrapper: optional Decoder1d + MLP-only path (no CNN) ---
@@ -203,13 +204,15 @@ class Data2VecRegressionHead(nn.Module):
             self.mlp_proj = nn.Sequential(*projs)
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        dtype = next(self.parameters()).dtype
+        x = x.to(dtype)
         if self.cnn_decoder is not None and mask is not None:
             # (B, T, C) -> Decoder1d -> (B, T, embed_dim) -> take masked
             x = self.cnn_decoder(x, mask_info=None)
             x = x.reshape(-1, x.size(-1))[mask]
-            return x
+            return x.to(dtype)
         assert self.mlp_proj is not None
-        return self.mlp_proj(x)
+        return self.mlp_proj(x).to(dtype)
 
 
 try:
