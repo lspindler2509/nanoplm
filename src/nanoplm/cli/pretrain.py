@@ -868,7 +868,7 @@ def _load_model_config(config: Dict[str, Any]) -> ProtModernBertMLMConfig:
         'injection_type',
         'sampling_scheme',
         'state_init',
-        # Data2Vec parameters
+        # Data2Vec parameters (only required when use_data2vec=True)
         'use_data2vec',
         'average_top_k_layers',
         'ema_decay',
@@ -878,7 +878,20 @@ def _load_model_config(config: Dict[str, Any]) -> ProtModernBertMLMConfig:
         'data2vec_loss_scale',
         'data2vec_layer_norm_targets',
         'data2vec_instance_norm_targets',
+        'data2vec_loss_dropout',
         'ema_transformer_layers_only',
+        'data2vec_head_layers',
+        'data2vec_use_cnn_decoder',
+        'data2vec_decoder_dim',
+        'data2vec_decoder_kernel',
+        'data2vec_decoder_layers',
+        'data2vec_decoder_groups',
+        'data2vec_decoder_residual',
+        'data2vec_projection_layers',
+        'data2vec_projection_ratio',
+        'data2vec_layer_norm_target_layer',
+        'data2vec_instance_norm_target_layer',
+        'data2vec_batch_norm_target_layer',
         'recycling_mode',
     }
     

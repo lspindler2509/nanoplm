@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from dataclasses import dataclass
 from typing import Optional, Union
 from transformers import ModernBertConfig, ModernBertPreTrainedModel
 from transformers.modeling_outputs import BaseModelOutput
@@ -20,6 +21,195 @@ def get_annealed_rate(start, end, curr_step, total_steps):
     r = end - start
     pct_remaining = 1 - curr_step / total_steps
     return end - r * pct_remaining
+
+
+# --- 1:1 from fairseq examples/data2vec/models/modalities/modules.py ---
+
+class SamePad(nn.Module):
+    """1:1 from fairseq.modules.same_pad.SamePad"""
+
+    def __init__(self, kernel_size: int, causal: bool = False):
+        super().__init__()
+        if causal:
+            self.remove = kernel_size - 1
+        else:
+            self.remove = 1 if kernel_size % 2 == 0 else 0
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.remove > 0:
+            x = x[:, :, : -self.remove]
+        return x
+
+
+class TransposeLast(nn.Module):
+    """1:1 from fairseq.modules.transpose_last.TransposeLast (transpose_dim=-2)."""
+
+    def __init__(self, tranpose_dim: int = -2):
+        super().__init__()
+        self.tranpose_dim = tranpose_dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x.transpose(self.tranpose_dim, -1)
+
+
+@dataclass
+class D2vDecoderConfig:
+    """1:1 from fairseq examples/data2vec/models/modalities/modules.py D2vDecoderConfig."""
+
+    decoder_dim: int = 384
+    decoder_groups: int = 16
+    decoder_kernel: int = 5
+    decoder_layers: int = 5
+    input_dropout: float = 0.1
+    add_positions_masked: bool = False
+    add_positions_all: bool = False
+    decoder_residual: bool = True
+    projection_layers: int = 1
+    projection_ratio: float = 2.0
+
+
+class DecoderBase(nn.Module):
+    """1:1 from fairseq DecoderBase."""
+
+    def __init__(self, cfg: D2vDecoderConfig):
+        super().__init__()
+        self.decoder_cfg = cfg
+
+    def reset_parameters(self) -> None:
+        for mod in self.proj.modules():
+            if isinstance(mod, nn.Linear):
+                mod.reset_parameters()
+
+    def add_residual(self, x: torch.Tensor, residual: Optional[torch.Tensor], i: int, mask_info: Optional[object]) -> torch.Tensor:
+        if (
+            residual is None
+            or not self.decoder_cfg.decoder_residual
+            or residual.size(1) != x.size(1)
+        ):
+            return x
+        return x + residual
+
+
+class Decoder1d(DecoderBase):
+    """1:1 from fairseq examples/data2vec/models/modalities/modules.py Decoder1d."""
+
+    def __init__(self, cfg: D2vDecoderConfig, input_dim: int):
+        super().__init__(cfg)
+
+        def make_block(in_dim: int) -> nn.Module:
+            block = [
+                nn.Conv1d(
+                    in_dim,
+                    cfg.decoder_dim,
+                    kernel_size=cfg.decoder_kernel,
+                    padding=cfg.decoder_kernel // 2,
+                    groups=cfg.decoder_groups,
+                ),
+                SamePad(cfg.decoder_kernel),
+                TransposeLast(),
+                nn.LayerNorm(cfg.decoder_dim, elementwise_affine=False),
+                TransposeLast(),
+                nn.GELU(),
+            ]
+            return nn.Sequential(*block)
+
+        self.blocks = nn.Sequential(
+            *[
+                make_block(input_dim if i == 0 else cfg.decoder_dim)
+                for i in range(cfg.decoder_layers)
+            ]
+        )
+
+        projs = []
+        curr_dim = cfg.decoder_dim
+        for i in range(cfg.projection_layers - 1):
+            next_dim = int(curr_dim * cfg.projection_ratio) if i == 0 else curr_dim
+            projs.append(nn.Linear(curr_dim, next_dim))
+            projs.append(nn.GELU())
+            curr_dim = next_dim
+        projs.append(nn.Linear(curr_dim, input_dim))
+        if len(projs) == 1:
+            self.proj = projs[0]
+        else:
+            self.proj = nn.Sequential(*projs)
+
+    def forward(self, x: torch.Tensor, mask_info: Optional[object] = None) -> torch.Tensor:
+        x = x.transpose(1, 2)
+        residual = x
+        for i, layer in enumerate(self.blocks):
+            x = layer(x)
+            x = self.add_residual(x, residual, i, mask_info)
+            residual = x
+        x = x.transpose(1, 2)
+        x = self.proj(x)
+        return x
+
+
+# --- Wrapper: optional Decoder1d + MLP-only path (no CNN) ---
+
+class Data2VecRegressionHead(nn.Module):
+    """
+    Data2Vec 2.0 head: either Fairseq Decoder1d (1:1) on full sequence, or MLP-only (2 layers).
+    When use_cnn_decoder=True: Decoder1d from fairseq modules.py; output (B,T,embed_dim), then take masked.
+    When use_cnn_decoder=False: 2-layer MLP only (projection_layers=2 style).
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        head_layers: int = 2,
+        use_cnn_decoder: bool = False,
+        decoder_dim: int = 384,
+        decoder_kernel: int = 5,
+        decoder_layers: int = 5,
+        decoder_groups: int = 16,
+        decoder_residual: bool = True,
+        projection_layers: int = 1,
+        projection_ratio: float = 2.0,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.use_cnn_decoder = use_cnn_decoder
+
+        if use_cnn_decoder:
+            assert embed_dim % decoder_groups == 0 and decoder_dim % decoder_groups == 0, (
+                f"embed_dim ({embed_dim}) and decoder_dim ({decoder_dim}) must be divisible by decoder_groups ({decoder_groups})"
+            )
+            cfg = D2vDecoderConfig(
+                decoder_dim=decoder_dim,
+                decoder_groups=decoder_groups,
+                decoder_kernel=decoder_kernel,
+                decoder_layers=decoder_layers,
+                decoder_residual=decoder_residual,
+                projection_layers=projection_layers,
+                projection_ratio=projection_ratio,
+            )
+            self.cnn_decoder = Decoder1d(cfg, embed_dim)
+            self.mlp_proj = None
+        else:
+            self.cnn_decoder = None
+            projs = []
+            curr_dim = embed_dim
+            for i in range(head_layers - 1):
+                next_dim = embed_dim * 2 if i == 0 else curr_dim
+                linear = nn.Linear(curr_dim, next_dim)
+                linear._is_regression_head = True
+                projs.append(linear)
+                projs.append(nn.GELU())
+                curr_dim = next_dim
+            final_linear = nn.Linear(curr_dim, embed_dim)
+            final_linear._is_regression_head = True
+            projs.append(final_linear)
+            self.mlp_proj = nn.Sequential(*projs)
+
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if self.cnn_decoder is not None and mask is not None:
+            # (B, T, C) -> Decoder1d -> (B, T, embed_dim) -> take masked
+            x = self.cnn_decoder(x, mask_info=None)
+            x = x.reshape(-1, x.size(-1))[mask]
+            return x
+        assert self.mlp_proj is not None
+        return self.mlp_proj(x)
 
 
 try:
@@ -274,28 +464,16 @@ class ModernBertForMaskedLMWithData2Vec(ModernBertPreTrainedModel):
                 target = target.view(-1, target.size(-1))
                 target_masked = target[mask_tokens]
         
-        # Student prediction (following fairseq exactly: apply regression head AFTER masking)
-        # In fairseq: x = x[masked_indices], then x = self.regression_head(x)
-        # IMPORTANT: Student output must be normalized the same way as teacher targets.
-        # last_hidden_state is normalized by final_norm, but teacher targets are normalized
-        # by layer_norm_target_layer (per-layer) + optionally layer_norm_targets (after averaging).
-        # We need to ensure consistency: if teacher uses layer_norm_target_layer, student should too.
-        if self.sparse_prediction:
-            # For sparse prediction, last_hidden_state is already masked
-            student_hidden = last_hidden_state
+        # Student prediction. Data2Vec 2.0: with CNN decoder we pass full (B,T,C) + mask; else mask first then MLP.
+        if getattr(self.model, 'use_cnn_decoder', False) and not self.sparse_prediction:
+            # Full sequence -> CNN (along time) -> take masked positions -> MLP
+            x = self.model.regression_head(last_hidden_state, mask_tokens)
         else:
-            # For dense prediction, mask first
-            student_hidden = last_hidden_state.view(-1, last_hidden_state.size(-1))[mask_tokens]
-        
-        # Apply same normalization as teacher targets (if layer_norm_target_layer was used)
-        # Since ModernBERT's last_hidden_state is normalized by final_norm, we need to check
-        # if we should apply additional normalization to match teacher targets.
-        # For now, we use last_hidden_state as-is (it's already normalized by final_norm),
-        # but we should verify this matches the teacher normalization scheme.
-        # Note: If teacher uses layer_norm_target_layer=True, each layer is normalized individually.
-        # Student's last_hidden_state is normalized by final_norm, which is similar but not identical.
-        # To be safe, we could apply layer_norm here too, but let's keep it as-is for now and verify.
-        x = self.model.regression_head(student_hidden)
+            if self.sparse_prediction:
+                student_hidden = last_hidden_state
+            else:
+                student_hidden = last_hidden_state.view(-1, last_hidden_state.size(-1))[mask_tokens]
+            x = self.model.regression_head(student_hidden, mask=None)
         y = target_masked
         
         # Loss computation using Cosine Similarity Loss (like JEPA)
@@ -528,28 +706,27 @@ class ModernBertModelWithData2Vec(ModernBertPreTrainedModel):
         self.ema_anneal_end_step = getattr(config, 'ema_anneal_end_step', 40000)
         self.use_data2vec = getattr(config, 'use_data2vec', False)
         
-        # Regression Head for Data2Vec
+        # Regression Head for Data2Vec (Data2Vec 2.0: optional 1D CNN + 2-layer MLP)
         if self.use_data2vec:
-            head_layers = getattr(config, 'data2vec_head_layers', 1)
+            head_layers = getattr(config, 'data2vec_head_layers', 2)  # data2vec 2.0 uses 2 MLP layers
             assert head_layers >= 1
-            
-            embed_dim = config.hidden_size
-            curr_dim = embed_dim
-            projs = []
-            for i in range(head_layers - 1):
-                next_dim = embed_dim * 2 if i == 0 else curr_dim
-                linear = nn.Linear(curr_dim, next_dim)
-                linear._is_regression_head = True  # Mark for initialization
-                projs.append(linear)
-                projs.append(nn.GELU())
-                curr_dim = next_dim
-            
-            final_linear = nn.Linear(curr_dim, embed_dim)
-            final_linear._is_regression_head = True  # Mark for initialization
-            projs.append(final_linear)
-            self.regression_head = nn.Sequential(*projs)
+            use_cnn_decoder = getattr(config, 'data2vec_use_cnn_decoder', False)
+            self.use_cnn_decoder = use_cnn_decoder
+            self.regression_head = Data2VecRegressionHead(
+                embed_dim=config.hidden_size,
+                head_layers=head_layers,
+                use_cnn_decoder=use_cnn_decoder,
+                decoder_dim=getattr(config, 'data2vec_decoder_dim', 384),
+                decoder_kernel=getattr(config, 'data2vec_decoder_kernel', 5),
+                decoder_layers=getattr(config, 'data2vec_decoder_layers', 5),
+                decoder_groups=getattr(config, 'data2vec_decoder_groups', 16),
+                decoder_residual=getattr(config, 'data2vec_decoder_residual', True),
+                projection_layers=getattr(config, 'data2vec_projection_layers', 1),
+                projection_ratio=getattr(config, 'data2vec_projection_ratio', 2.0),
+            )
         else:
             self.regression_head = None
+            self.use_cnn_decoder = False
         
         self.post_init()
 
@@ -594,6 +771,11 @@ class ModernBertModelWithData2Vec(ModernBertPreTrainedModel):
             # Regression head for Data2Vec: initialize with larger std for better initial predictions
             # Use "in" std instead of "out" std to allow larger initial values
             init_weight(module, stds["in"])
+        elif isinstance(module, nn.Conv1d):
+            # Data2Vec 2.0 CNN decoder
+            init_weight(module, stds["in"])
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Linear) and hasattr(module, '_is_s_init') and module._is_s_init:
             # s_init for Boltz2-style recycling: initialize like input projections
             init_weight(module, stds["in"])

@@ -82,7 +82,7 @@ class ProtModernBertMLMConfig:
     sampling_scheme: Optional[str] = "uniform-0-4"  # Sampling scheme for num_steps_no_grad (uniform 0-4 recurrent steps)
     state_init: Optional[str] = "like-init"  # Options: "normal", "embed", "like-init", "zero", "unit"
     recycling_mode: Optional[str] = "recurrentgpt"  # Options: "recurrentgpt" (default) or "boltz2" (additive recycling like AlphaFold/Boltz2)
-    # Data2Vec parameters
+    # Data2Vec parameters (optional; only required/used when use_data2vec=True)
     use_data2vec: Optional[bool] = False  # Enable Data2Vec self-supervised learning
     average_top_k_layers: Optional[int] = 4  # Number of top layers to average for teacher target
     ema_decay: Optional[float] = 0.999  # Initial EMA decay rate
@@ -92,7 +92,21 @@ class ProtModernBertMLMConfig:
     data2vec_loss_scale: Optional[float] = -1.0  # Loss scale (-1.0 = auto = 1/sqrt(hidden_size) as in fairseq, >0 = explicit scale)
     data2vec_layer_norm_targets: Optional[bool] = False  # Apply layer norm to teacher targets (improves stability)
     data2vec_instance_norm_targets: Optional[bool] = False  # Apply instance norm to teacher targets (improves stability)
+    data2vec_loss_dropout: Optional[float] = 0.5  # Per-batch probability to skip data2vec loss (and teacher forward). 0.5 = 50:50, 0 = never skip. Saves time.
     ema_transformer_layers_only: Optional[bool] = False  # If True, share embeddings & embed norm (copy from student); only transformer layers get EMA (like Fairseq)
+    # Data2Vec 2.0 regression head (optional; only used when use_data2vec=True). Defaults match fairseq D2vDecoderConfig.
+    data2vec_head_layers: Optional[int] = 2  # MLP layers when CNN decoder off (data2vec 2.0 style)
+    data2vec_use_cnn_decoder: Optional[bool] = True  # Use 1D CNN decoder before MLP (Data2Vec 2.0 default, fairseq Decoder1d)
+    data2vec_decoder_dim: Optional[int] = 384  # D2vDecoderConfig default
+    data2vec_decoder_kernel: Optional[int] = 5  # D2vDecoderConfig default
+    data2vec_decoder_layers: Optional[int] = 5  # D2vDecoderConfig default
+    data2vec_decoder_groups: Optional[int] = 16  # D2vDecoderConfig default
+    data2vec_decoder_residual: Optional[bool] = True  # D2vDecoderConfig default
+    data2vec_projection_layers: Optional[int] = 1  # D2vDecoderConfig default
+    data2vec_projection_ratio: Optional[float] = 2.0  # D2vDecoderConfig default
+    data2vec_layer_norm_target_layer: Optional[bool] = False
+    data2vec_instance_norm_target_layer: Optional[bool] = False
+    data2vec_batch_norm_target_layer: Optional[bool] = False
 
 class ProtModernBertMLM(nn.Module):
     """
@@ -231,6 +245,7 @@ class ProtModernBertMLM(nn.Module):
             self.config.data2vec_loss_scale = config.data2vec_loss_scale
             self.config.data2vec_layer_norm_targets = config.data2vec_layer_norm_targets
             self.config.data2vec_instance_norm_targets = config.data2vec_instance_norm_targets
+            self.config.data2vec_loss_dropout = config.data2vec_loss_dropout
             self.bert_model = ModernBertForMaskedLMWithRecycling(self.config)
         elif self.use_triangular_attention:
             print("🔺 Building MODULAR architecture with triangular attention")
@@ -253,11 +268,20 @@ class ProtModernBertMLM(nn.Module):
             self.config.data2vec_loss_scale = config.data2vec_loss_scale
             self.config.data2vec_layer_norm_targets = config.data2vec_layer_norm_targets
             self.config.data2vec_instance_norm_targets = config.data2vec_instance_norm_targets
-            self.config.data2vec_head_layers = getattr(config, 'data2vec_head_layers', 1)
-            self.config.ema_transformer_layers_only = getattr(config, 'ema_transformer_layers_only', False)
-            self.config.data2vec_layer_norm_target_layer = getattr(config, 'data2vec_layer_norm_target_layer', False)
-            self.config.data2vec_instance_norm_target_layer = getattr(config, 'data2vec_instance_norm_target_layer', False)
-            self.config.data2vec_batch_norm_target_layer = getattr(config, 'data2vec_batch_norm_target_layer', False)
+            self.config.data2vec_loss_dropout = config.data2vec_loss_dropout
+            self.config.data2vec_head_layers = config.data2vec_head_layers
+            self.config.data2vec_use_cnn_decoder = config.data2vec_use_cnn_decoder
+            self.config.data2vec_decoder_dim = config.data2vec_decoder_dim
+            self.config.data2vec_decoder_kernel = config.data2vec_decoder_kernel
+            self.config.data2vec_decoder_layers = config.data2vec_decoder_layers
+            self.config.data2vec_decoder_groups = config.data2vec_decoder_groups
+            self.config.data2vec_decoder_residual = config.data2vec_decoder_residual
+            self.config.data2vec_projection_layers = config.data2vec_projection_layers
+            self.config.data2vec_projection_ratio = config.data2vec_projection_ratio
+            self.config.ema_transformer_layers_only = config.ema_transformer_layers_only
+            self.config.data2vec_layer_norm_target_layer = config.data2vec_layer_norm_target_layer
+            self.config.data2vec_instance_norm_target_layer = config.data2vec_instance_norm_target_layer
+            self.config.data2vec_batch_norm_target_layer = config.data2vec_batch_norm_target_layer
             self.bert_model = ModernBertForMaskedLMWithData2Vec(self.config)
         else:
             print("🔧 Building STANDARD ModernBERT architecture")
