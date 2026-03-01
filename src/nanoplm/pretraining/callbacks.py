@@ -132,6 +132,16 @@ class Data2VecLossLoggingCallback(TrainerCallback):
                         ema_decay = bert_model.model.ema.get_decay()
                         loss_logs[f"{prefix}ema_decay"] = ema_decay
 
+                # Log how often only MLM vs MLM+Data2Vec was computed (per logging window)
+                # mlm_acc has one entry per micro-batch; d2v_acc only when data2vec was not skipped
+                if mlm_acc and not is_eval:
+                    n_batches = len(mlm_acc)
+                    n_d2v = len(d2v_acc)
+                    n_mlm_only = n_batches - n_d2v
+                    loss_logs["train/data2vec_batches_ratio"] = n_d2v / n_batches
+                    loss_logs["train/mlm_only_batches"] = n_mlm_only
+                    loss_logs["train/data2vec_batches"] = n_d2v
+
                 if loss_logs:
                     wandb.log(loss_logs)
                 
