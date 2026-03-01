@@ -280,11 +280,13 @@ class ModernBertForMaskedLMWithData2Vec(ModernBertPreTrainedModel):
         elif isinstance(module, ModernBertForMaskedLMWithData2Vec):
             init_weight(module.decoder, stds["out"])
         elif isinstance(module, nn.LayerNorm):
-            module.weight.data.fill_(1.0)
+            if module.weight is not None:
+                module.weight.data.fill_(1.0)
             if module.bias is not None:
                 module.bias.data.zero_()
         elif isinstance(module, nn.RMSNorm):
-            module.weight.data.fill_(1.0)
+            if module.weight is not None:
+                module.weight.data.fill_(1.0)
 
     def get_output_embeddings(self):
         return self.decoder
@@ -780,11 +782,13 @@ class ModernBertModelWithData2Vec(ModernBertPreTrainedModel):
             # s_init for Boltz2-style recycling: initialize like input projections
             init_weight(module, stds["in"])
         elif isinstance(module, nn.LayerNorm):
-            module.weight.data.fill_(1.0)
+            if module.weight is not None:
+                module.weight.data.fill_(1.0)
             if module.bias is not None:
                 module.bias.data.zero_()
         elif isinstance(module, nn.RMSNorm):
-            module.weight.data.fill_(1.0)
+            if module.weight is not None:
+                module.weight.data.fill_(1.0)
 
     def get_input_embeddings(self):
         return self.embeddings.tok_embeddings
